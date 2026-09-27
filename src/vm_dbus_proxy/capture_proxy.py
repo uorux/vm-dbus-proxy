@@ -22,6 +22,8 @@ from .proxy import auth_line
 LOG=logging.getLogger('vm-dbus-capture')
 PORTAL='org.freedesktop.portal.Desktop'
 SCREEN='org.freedesktop.portal.ScreenCast'
+BUS='org.freedesktop.DBus'
+BUS_PATH='/org/freedesktop/DBus'
 PATH='/org/freedesktop/portal/desktop'
 LIMIT=protocol.MAX_MESSAGE_BYTES
 MAX_SESSIONS=4
@@ -242,7 +244,20 @@ class Host(Adapter):
             pending=self.pending.pop(f.fields.get(5),None) if f.message_type in (2,3) else None
             if pending:
                 call,internal=pending
-                if call.fields.get(6)==PORTAL and f.fields.get(7): self.portal_sender=f.fields[7]
+                # GDBus resolves the well-known name before calling a proxy;
+                # all its portal calls may therefore target only :1.NNN.
+                # Learn that identity only from the bus daemon's reply.
+                if (call.fields.get(6)==BUS and call.fields.get(1)==BUS_PATH
+                        and call.fields.get(2)==BUS and call.fields.get(3)=='GetNameOwner'
+                        and f.message_type==2 and f.fields.get(7)==BUS
+                        and call.fields.get(8)=='s' and body(call)==(PORTAL,)
+                        and f.fields.get(8)=='s'):
+                    owner=body(f)[0]
+                    if not owner.startswith(':'): raise protocol.ProtocolError('invalid portal owner')
+                    self.portal_sender=owner
+                elif (call.fields.get(6)==PORTAL and f.message_type==2
+                        and f.fields.get(7,'').startswith(':')):
+                    self.portal_sender=f.fields[7]
                 if internal:
                     key,node=internal
                     if f.message_type!=2 or f.fields.get(8)!='h' or len(fds)!=1 or body(f)!=(0,):
@@ -258,6 +273,7 @@ class Host(Adapter):
                     self.name=body(f)[0]
                 if call.fields.get(6) in (PORTAL,self.portal_sender) and call.fields.get(1)==PATH and call.fields.get(2)==SCREEN and call.fields.get(3)=='Start' and f.message_type==2:
                     key=body(call)[0]; request=body(f)[0]; self.requests[request]=(key,f.fields.get(7))
+                    LOG.info('tracking ScreenCast Start response')
                 fields=dict(f.fields); fields[5]=call.serial
                 fdata=replace_reply_serial(f,call.serial)
             else: fdata=f.data
@@ -268,6 +284,13 @@ class Host(Adapter):
                     from dataclasses import replace
                     self.tunnel.send(b'D',protocol.make_error(replace(f,fields=fields),f.serial))
                 return
+            if (f.message_type==4 and f.fields.get(7)==BUS and f.fields.get(1)==BUS_PATH
+                    and f.fields.get(2)==BUS and f.fields.get(3)=='NameOwnerChanged'
+                    and f.fields.get(8)=='sss'):
+                name,old,new=body(f)
+                if name==PORTAL:
+                    if new and not new.startswith(':'): raise protocol.ProtocolError('invalid portal owner')
+                    self.portal_sender=new or None
             if f.message_type==4 and f.fields.get(2)=='org.freedesktop.portal.Session' and f.fields.get(3)=='Closed':
                 key=f.fields.get(1); self.close_session(key); self.tunnel.json(b'X',{'session':key})
             key=self.requests.pop(f.fields.get(1),None) if f.message_type==4 and f.fields.get(2)=='org.freedesktop.portal.Request' and f.fields.get(3)=='Response' else None
@@ -279,6 +302,7 @@ class Host(Adapter):
                     if streams[0]!='a(ua{sv})' or len(streams[1])!=1:
                         self.tunnel.send(b'D',replace_body(f,(2,[]))); return
                     node=streams[1][0][0]
+                    LOG.info('approved ScreenCast stream; opening restricted PipeWire remote')
                     with self.lock:
                         if self.closed or key in self.held or len(self.held)>=MAX_SESSIONS:
                             self.tunnel.send(b'D',replace_body(f,(2,[]))); return
@@ -303,6 +327,7 @@ class Host(Adapter):
         for name,v in options:
             if name=='streams': v=(v[0],[(node,v[1][0][1])])
             out.append((name,v))
+        LOG.info('guest capture source ready; returning translated Start response')
         self.tunnel.send(b'D',replace_body(f,(result,out)))
     def fail(self,key,timeout=False):
         with self.lock:

@@ -32,6 +32,49 @@ class HostTests(unittest.TestCase):
         h.ready(b'{"session":"/org/freedesktop/portal/desktop/session/1_2/abc","node":101}')
         result=frame(h.tunnel.send.call_args.args[1]); self.assertEqual(body(result)[1][0][1][1][0][0],101)
         self.assertEqual(result.fields[7],':1.5')
+    def test_unique_portal_destination_is_intercepted_after_owner_lookup(self):
+        h=self.make_host()
+        bus='org.freedesktop.DBus'
+        lookup=frame(message(1,80,{1:'/org/freedesktop/DBus',2:bus,3:'GetNameOwner',6:bus,8:'s'},(PORTAL,)))
+        h.from_guest(lookup.data)
+        h.from_host(frame(message(2,10,{5:1,7:bus,8:'s'},(':1.55',))),[])
+        self.assertEqual(h.portal_sender,':1.55')
+        key='/org/freedesktop/portal/desktop/session/1_2/abc'
+        request='/org/freedesktop/portal/desktop/request/1_2/start'
+        select=frame(message(1,81,{1:PATH,2:SCREEN,3:'SelectSources',6:':1.55',8:'oa{sv}'},
+                             (key,[('multiple',('b',1)),('cursor_mode',('u',4))])))
+        h.from_guest(select.data)
+        forwarded=frame(h.upstream.sendall.call_args.args[0])
+        self.assertEqual(dict(body(forwarded)[1]),{'multiple':('b',0),'cursor_mode':('u',2)})
+        call=frame(message(1,82,{1:PATH,2:SCREEN,3:'Start',6:':1.55',8:'osa{sv}'},(key,'',[])))
+        h.from_guest(call.data)
+        h.from_host(frame(message(2,11,{5:3,7:':1.55',8:'o'},(request,))),[])
+        response=frame(message(4,12,{1:request,2:'org.freedesktop.portal.Request',3:'Response',7:':1.55',8:'ua{sv}'},
+                               (0,[('streams',('a(ua{sv})',[(72,[])]))])))
+        h.tunnel.send.reset_mock()
+        with patch('threading.Timer'):
+            h.from_host(response,[])
+        h.tunnel.send.assert_not_called()
+        self.assertIn(key,h.held)
+        self.assertEqual(frame(h.upstream.sendall.call_args.args[0]).fields[3],'OpenPipeWireRemote')
+        h.close()
+
+    def test_owner_tracking_requires_bus_sender(self):
+        h=self.make_host(); bus='org.freedesktop.DBus'
+        lookup=frame(message(1,80,{1:'/org/freedesktop/DBus',2:bus,3:'GetNameOwner',6:bus,8:'s'},(PORTAL,)))
+        h.from_guest(lookup.data)
+        h.from_host(frame(message(2,10,{5:1,7:':1.666',8:'s'},(':1.666',))),[])
+        self.assertIsNone(h.portal_sender)
+        for sender,owner in [(':1.666',None),(bus,':1.55')]:
+            changed=frame(message(4,11,{1:'/org/freedesktop/DBus',2:bus,3:'NameOwnerChanged',7:sender,8:'sss'},
+                                  (PORTAL,'',':1.55')))
+            h.from_host(changed,[])
+            self.assertEqual(h.portal_sender,owner)
+        lost=frame(message(4,12,{1:'/org/freedesktop/DBus',2:bus,3:'NameOwnerChanged',7:bus,8:'sss'},
+                           (PORTAL,':1.55','')))
+        h.from_host(lost,[])
+        self.assertIsNone(h.portal_sender)
+
     def test_unexpected_host_fd_reply_is_error_and_all_fds_close(self):
         import os
         from helpers import stream_pair, feed
