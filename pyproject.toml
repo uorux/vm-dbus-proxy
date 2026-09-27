@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vm-dbus-proxy"
+version = "0.1.0"
+description = "A D-Bus transport adapter for virtual machines with FD-free upstream links"
+requires-python = ">=3.11"
+
+[project.scripts]
+vm-dbus-proxy = "vm_dbus_proxy.proxy:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
