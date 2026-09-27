@@ -25,10 +25,10 @@ closes received descriptors, and returns
 messages continue on the same connection. FD-bearing replies become errors to
 the original caller; FD-bearing signals and no-reply calls are dropped.
 
-This does **not** implement cross-VM descriptor transfer. Portals returning
-PipeWire sockets or other descriptors still need a dedicated bridge. The
-upstream transport must never negotiate Unix FD support; it should enforce
-that independently of this adapter. No access policies are relaxed here.
+The plain adapter does **not** implement cross-VM descriptor transfer. Its
+upstream transport must never negotiate Unix FD support. The optional
+ScreenCast bridge described below handles approved capture streams through
+virtio-nvgpu; other descriptor-bearing portals remain unsupported.
 
 ## Run
 
@@ -78,3 +78,46 @@ until it can be published. After changing proxy code, commit this repository
 and run `nix flake update vm-dbus-proxy` in the parent checkout. The guest starts
 `sbx-dbus-proxy.service` after `sbx-relay.service`; application launch waits for
 its socket. Inspect `journalctl -u sbx-dbus-proxy` inside the VM when testing.
+
+## VM ScreenCast bridge
+
+Capture-enabled virtio-nvgpu VMs use `vm-dbus-capture-proxy` on both sides of
+an explicitly framed `capture-dbus` relay. The host adapter negotiates FD
+support only with the local filtering proxy. After an approved ScreenCast
+Start, it obtains the restricted PipeWire remote on that same bus connection.
+A dedicated per-VM broker consumes it and injects the approved DMA-BUFs.
+The guest broker imports them and starts a private PipeWire server and
+WirePlumber policy manager for that session. The adapter replaces the portal
+node ID and returns a connected guest-local PipeWire FD to the application.
+No host PipeWire socket or arbitrary descriptors cross the VM boundary.
+
+The host capture adapter is part of the host boundary: it validates the
+portal response sender and only accepts a PipeWire FD correlated to its own
+OpenPipeWireRemote request. The injector authenticates the separate capture
+broker uid. Each broker authenticates its configured adapter uid, limits
+concurrent sessions to four and terminates workers when the adapter closes.
+Other FD-bearing operations retain the ordinary unsupported-operation policy.
+See [capture/README.md](capture/README.md) for format and lifecycle limits.
+Python entry points are available via pip; the C worker requires the Nix
+package or a separate native build.
+
+After rebuilding the parent NixOS configuration, fully stop and relaunch the
+VM, then test:
+
+1. Share one monitor in Chromium; verify moving content for at least 30 seconds.
+2. Stop, share one window, stop, and share again. Cancel the picker once too.
+3. Close the browser/VM during a share; the host sharing indicator must disappear.
+4. Check notifications and file selection before and after sharing.
+
+Capture currently requires virtio-nvgpu and an approved DMA-BUF stream. There
+is no CPU-copy fallback. Run-time GPU/PipeWire acceptance is not covered by
+unit tests. Collect these logs after a failed attempt:
+
+```sh
+# Host
+journalctl -b -u sandbox-vm-ungoogled-chromium-capture-bus \
+  -u sandbox-vm-ungoogled-chromium-capture-broker \
+  -u sandbox-vm-ungoogled-chromium-gpu --since '-5 minutes' --no-pager
+# Inside the VM, using its existing SSH entry point
+journalctl -b -u sbx-dbus-proxy -u sbx-capture-broker --no-pager
+```

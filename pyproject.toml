@@ -10,6 +10,8 @@ requires-python = ">=3.11"
 
 [project.scripts]
 vm-dbus-proxy = "vm_dbus_proxy.proxy:main"
+vm-dbus-capture-proxy = "vm_dbus_proxy.capture_proxy:main"
+vm-capture-broker = "vm_dbus_proxy.capture_broker:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
