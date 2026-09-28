@@ -62,7 +62,7 @@ struct app {
     unsigned char input[sizeof(struct packet)]; size_t input_used;
 };
 static void fail(struct app *a, const char *why) {
-    if (!a->stopping) fprintf(stderr, "vm-capture: %s (%s)\n", why, strerror(errno));
+    if (!a->stopping) fprintf(stderr, "vm-capture[%s]: %s (%s)\n", a->guest?"guest":"host", why, strerror(errno));
     a->stopping = true; a->result = 1;
     pw_main_loop_quit(a->loop);
 }
@@ -142,11 +142,18 @@ static bool accept_format(struct app *a, const struct spa_video_info_raw *f) {
 }
 static void param_changed(void *data, uint32_t id, const struct spa_pod *param) {
     struct app *a=data;
-    if (id!=SPA_PARAM_Format || !param || a->stopping) return;
+    if (id!=SPA_PARAM_Format || a->stopping) return;
+    if (!param) {
+        fprintf(stderr,"vm-capture[%s]: format cleared\n",a->guest?"guest":"host");
+        return;
+    }
     struct spa_video_info_raw f={0};
     if (spa_format_video_raw_parse(param,&f)<0) {
         errno=EINVAL; fail(a,"invalid capture format"); return;
     }
+    fprintf(stderr,"vm-capture[%s]: format %ux%u format=%u modifier=%#llx flags=%#x exported=%u ready=%d\n",
+        a->guest?"guest":"host",f.size.width,f.size.height,f.format,
+        (unsigned long long)f.modifier,f.flags,a->count,a->ready);
     if (!accept_format(a,&f)) return;
     unsigned char storage[1024]; struct spa_pod_builder b=SPA_POD_BUILDER_INIT(storage,sizeof storage);
     const struct spa_pod *params[4];
@@ -205,6 +212,12 @@ static void add_buffer(void *data, struct pw_buffer *b) {
 }
 static void remove_buffer(void *data, struct pw_buffer *b) {
     struct app *a=data;
+    if (!a->stopping) {
+        uint32_t i;
+        for(i=0;i<a->count;i++) if(a->slots[i].pw==b) break;
+        fprintf(stderr,"vm-capture[%s]: removing buffer slot=%u pool=%u streaming=%d ready=%d sequence=%llu\n",
+            a->guest?"guest":"host",i,a->count,a->streaming,a->ready,(unsigned long long)a->sequence);
+    }
     if (!a->stopping) { errno=ENOTSUP; fail(a,"capture buffer pool removed; restart sharing"); }
     (void)b;
 }
@@ -266,7 +279,9 @@ static void process(void *data) {
     }
 }
 static void state_changed(void *data, enum pw_stream_state old, enum pw_stream_state state, const char *error) {
-    struct app *a=data; (void)old;
+    struct app *a=data;
+    fprintf(stderr,"vm-capture[%s]: stream %s -> %s%s%s\n",a->guest?"guest":"host",
+        pw_stream_state_as_string(old),pw_stream_state_as_string(state),error?": ":"",error?error:"");
     a->streaming=state==PW_STREAM_STATE_STREAMING;
     if(state==PW_STREAM_STATE_ERROR) { errno=EIO; fail(a,error?error:"PipeWire stream failed"); }
     if(a->guest && state==PW_STREAM_STATE_PAUSED && !a->ready) {

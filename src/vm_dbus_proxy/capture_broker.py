@@ -181,10 +181,16 @@ context.modules = [
             try:
                 data = conn.recv(1)
                 if not data:
+                    LOG.info('%s capture adapter closed its broker connection', role)
                     return
                 raise ValueError('unexpected broker control data')
             except socket.timeout:
                 pass
+        for process in processes:
+            code = process.poll()
+            if code is not None:
+                LOG.warning('%s capture worker %s exited with status %s',
+                            role, os.path.basename(process.args[0]), code)
 
 
 def main():
