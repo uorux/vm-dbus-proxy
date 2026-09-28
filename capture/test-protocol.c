@@ -100,7 +100,7 @@ int main(void) {
     f.modifier=123;assert(!accept_format(&a,&f) && a.stopping); /* guest import immutable */
     pw_main_loop_destroy(a.loop);
     /* Reproduce xdph's four-buffer bootstrap: recycle all frames until the
-     * guest links, then keep one producer buffer free despite a stalled guest.
+     * guest links, then reserve the remaining buffers for producer/graph scheduling.
      * Exercise process(), FLOW and DONE together, not just the limit predicate. */
     a=fresh();a.guest=false;a.ready=true;a.count=4;
     a.format=(struct spa_video_info_raw){.size=SPA_RECTANGLE(1920,1080)};
@@ -119,17 +119,17 @@ int main(void) {
     p=(struct packet){.magic=htole32(0x31504356),.op=htole32(FLOW),.count=htole32(1)};
     receive_packet(&a,p);assert(a.consumer_active && !a.stopping);
     dequeue_next=returned=0;process(&a);
-    assert(!a.stopping && returned==1 && frames==3 && a.sequence==3);
+    assert(!a.stopping && returned==3 && frames==1 && a.sequence==1);
     assert(!a.slots[3].sent_ns);
     dequeued[0]=&pw_buffers[3];dequeue_count=1;dequeue_next=0;process(&a);
-    assert(returned==2 && frames==3); /* unacknowledged slots stay held */
+    assert(returned==4 && frames==1); /* unacknowledged slots stay held */
     struct packet done={.magic=htole32(0x31504356),.op=htole32(DONE),.slot=0,.seq=htole64(1)};
-    receive_packet(&a,done);assert(!a.stopping && returned==3 && !a.slots[0].sent_ns);
+    receive_packet(&a,done);assert(!a.stopping && returned==5 && !a.slots[0].sent_ns);
     dequeued[0]=&pw_buffers[0];dequeue_next=0;process(&a);
-    assert(frames==4 && le64toh(last_frame.seq)==4 && le32toh(last_frame.slot)==0);
+    assert(frames==2 && le64toh(last_frame.seq)==2 && le32toh(last_frame.slot)==0);
     p.count=0;receive_packet(&a,p);assert(!a.consumer_active);
     dequeued[0]=&pw_buffers[3];dequeue_next=0;process(&a);
-    assert(frames==4 && returned==4 && !a.stopping);
+    assert(frames==2 && returned==6 && !a.stopping);
     p.count=htole32(2);receive_packet(&a,p);assert(a.stopping);
     pw_main_loop_destroy(a.loop);
     puts("capture control validation: passed");pw_deinit();return 0;

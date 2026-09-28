@@ -30,9 +30,9 @@ Operations: CONFIG=1, BUFFER=2, READY=3, FRAME=4, DONE=5, FLOW=6. CONFIG precede
 buffer until the matching DONE arrives after the guest consumer returns it.
 FLOW carries the guest consumer's streaming state in count (0 or 1). Until
 the guest is streaming, host frames are dropped and immediately returned.
-At most pool-size minus one frames may be outstanding; excess frames are also
-dropped so the producer always has a buffer available. This prevents xdph's
-out-of-buffers renegotiation during guest startup or slow consumption.
+At most one frame may be outstanding; excess frames are dropped so the
+remaining buffers stay available for the producer and PipeWire graph. A single
+nominally free buffer did not provide enough scheduling headroom on xdph.
 A five-second missing acknowledgement terminates the session rather than
 reusing a buffer still owned by a consumer. The channel carries metadata,
 not pixels; imported DMA-BUFs carry pixels.

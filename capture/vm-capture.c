@@ -245,12 +245,14 @@ static void guest_process(struct app *a) {
 }
 /* Never lend the whole producer pool to a slower (or not yet linked) guest.
  * xdph renegotiates its pool when no buffer is available for the next copy.
+ * Keep only one frame in flight: the producer and PipeWire graph also need
+ * buffers, so one nominally free slot is insufficient scheduling headroom.
  * Dropping a frame here is safe: it has not been announced to the guest. */
 static bool can_forward_frame(const struct app *a) {
     if (!a->consumer_active || a->count<2) return false;
     uint32_t held=0;
     for(uint32_t i=0;i<a->count;i++) if(a->slots[i].sent_ns) held++;
-    return held<a->count-1;
+    return held==0;
 }
 static void process(void *data) {
     struct app *a=data; if (a->stopping) return;
