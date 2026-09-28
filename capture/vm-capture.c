@@ -122,19 +122,32 @@ static uint32_t fourcc(uint32_t f) {
     default: return 0;
     }
 }
+/* The producer first negotiates a modifier choice with DONT_FIXATE, then
+ * tests allocation and announces the selected modifier. That first callback
+ * does not describe an allocated buffer layout. Lock the host layout only
+ * once a buffer has been exported, not on the first format callback. */
+static bool accept_format(struct app *a, const struct spa_video_info_raw *f) {
+    if (f->flags & SPA_VIDEO_FLAG_MODIFIER_FIXATION_REQUIRED) return false;
+    if (!fourcc(f->format) || !f->size.width || !f->size.height ||
+        f->size.width>8192 || f->size.height>8192 || !(f->flags & SPA_VIDEO_FLAG_MODIFIER)) {
+        errno=EINVAL; fail(a,"unsupported capture format; DMA-BUF required"); return false;
+    }
+    if (a->configured && (a->guest || a->count || a->ready) &&
+        (f->format!=a->format.format || f->size.width!=a->format.size.width ||
+         f->size.height!=a->format.size.height || f->modifier!=a->format.modifier)) {
+        errno=ENOTSUP; fail(a,"capture format changed after buffer export; restart screen sharing"); return false;
+    }
+    a->format=*f; a->configured=true;
+    return true;
+}
 static void param_changed(void *data, uint32_t id, const struct spa_pod *param) {
     struct app *a=data;
-    if (id!=SPA_PARAM_Format || !param) return;
+    if (id!=SPA_PARAM_Format || !param || a->stopping) return;
     struct spa_video_info_raw f={0};
-    if (spa_format_video_raw_parse(param,&f)<0 || !fourcc(f.format) ||
-        !f.size.width || !f.size.height || f.size.width>8192 || f.size.height>8192 ||
-        !(f.flags & SPA_VIDEO_FLAG_MODIFIER)) { errno=EINVAL; fail(a,"unsupported capture format; DMA-BUF required"); return; }
-    if (a->configured && (f.format!=a->format.format || f.size.width!=a->format.size.width ||
-        f.size.height!=a->format.size.height || f.modifier!=a->format.modifier)) {
-        errno=ENOTSUP; fail(a,"capture format changed; restart screen sharing"); return;
+    if (spa_format_video_raw_parse(param,&f)<0) {
+        errno=EINVAL; fail(a,"invalid capture format"); return;
     }
-    a->format=f; a->configured=true;
-    if (!a->guest) send_packet(a,(struct packet){.op=CONFIG,.width=f.size.width,.height=f.size.height,.format=f.format,.modifier=f.modifier});
+    if (!accept_format(a,&f)) return;
     unsigned char storage[1024]; struct spa_pod_builder b=SPA_POD_BUILDER_INIT(storage,sizeof storage);
     const struct spa_pod *params[4];
     params[0]=spa_pod_builder_add_object(&b,SPA_TYPE_OBJECT_ParamBuffers,SPA_PARAM_Buffers,
@@ -164,7 +177,7 @@ static void add_buffer(void *data, struct pw_buffer *b) {
         d->chunk->size=s->imported.strides[0]*a->format.size.height;
         return;
     }
-    if (a->ready || a->count>=32 || buf->n_datas!=1 || buf->datas[0].type!=SPA_DATA_DmaBuf) {
+    if (!a->configured || a->ready || a->count>=32 || buf->n_datas!=1 || buf->datas[0].type!=SPA_DATA_DmaBuf) {
         errno=ENOTSUP; fail(a,"unsupported host buffer pool or reallocation"); return;
     }
     uint32_t n=a->count; struct slot *s=&a->slots[n]; s->pw=b;
@@ -184,6 +197,9 @@ static void add_buffer(void *data, struct pw_buffer *b) {
     s->id=le32toh(r.id);
     s->imported.offsets[0]=d->mapoffset+d->chunk->offset;
     s->imported.strides[0]=d->chunk->stride;
+    if (!a->count && send_packet(a,(struct packet){.op=CONFIG,
+            .width=a->format.size.width,.height=a->format.size.height,
+            .format=a->format.format,.modifier=a->format.modifier})<0) return;
     a->count++;
     struct packet p={.op=BUFFER,.slot=n,.id=s->id}; memcpy(p.token,r.token,16); send_packet(a,p);
 }

@@ -45,5 +45,34 @@ int main(void) {
     p.id=htole32(UINT32_MAX);receive_packet(&a,p);assert(a.stopping);pw_main_loop_destroy(a.loop);
     a=fresh();receive_packet(&a,config(1920,1080));a.stream=(struct pw_stream *)1;a.count=1;
     p.id=0;p.format=htole32(8);receive_packet(&a,p);assert(a.stopping);pw_main_loop_destroy(a.loop);
+    /* Exercise the actual SPA DONT_FIXATE parser and the producer's two
+     * negotiation callbacks, with no live daemon or GPU required. */
+    a=fresh();a.guest=false;
+    unsigned char storage[512];struct spa_pod_builder builder=SPA_POD_BUILDER_INIT(storage,sizeof storage);
+    struct spa_pod_frame object,choice;
+    spa_pod_builder_push_object(&builder,&object,SPA_TYPE_OBJECT_Format,SPA_PARAM_Format);
+    spa_pod_builder_add(&builder,
+        SPA_FORMAT_mediaType,SPA_POD_Id(SPA_MEDIA_TYPE_video),
+        SPA_FORMAT_mediaSubtype,SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+        SPA_FORMAT_VIDEO_format,SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
+        SPA_FORMAT_VIDEO_size,SPA_POD_Rectangle(&SPA_RECTANGLE(1920,1080)),0);
+    spa_pod_builder_prop(&builder,SPA_FORMAT_VIDEO_modifier,SPA_POD_PROP_FLAG_MANDATORY|SPA_POD_PROP_FLAG_DONT_FIXATE);
+    spa_pod_builder_push_choice(&builder,&choice,SPA_CHOICE_Enum,0);
+    spa_pod_builder_long(&builder,0);spa_pod_builder_long(&builder,0);spa_pod_builder_long(&builder,123);
+    spa_pod_builder_pop(&builder,&choice);
+    const struct spa_pod *offer=spa_pod_builder_pop(&builder,&object);
+    struct spa_video_info_raw f={0};
+    assert(spa_format_video_raw_parse(offer,&f)>=0);
+    assert(f.flags & SPA_VIDEO_FLAG_MODIFIER_FIXATION_REQUIRED);
+    assert(!accept_format(&a,&f) && !a.configured && !a.stopping);
+    f.flags &= ~SPA_VIDEO_FLAG_MODIFIER_FIXATION_REQUIRED;f.modifier=123;
+    assert(accept_format(&a,&f) && a.format.modifier==123 && !a.stopping);
+    f.modifier=456;assert(accept_format(&a,&f)); /* still no exported buffers */
+    a.count=1;assert(accept_format(&a,&f)); /* repeated identical callback */
+    f.modifier=789;assert(!accept_format(&a,&f) && a.stopping);
+    pw_main_loop_destroy(a.loop);
+    a=fresh();receive_packet(&a,config(1920,1080));
+    f.modifier=123;assert(!accept_format(&a,&f) && a.stopping); /* guest import immutable */
+    pw_main_loop_destroy(a.loop);
     puts("capture control validation: passed");pw_deinit();return 0;
 }
