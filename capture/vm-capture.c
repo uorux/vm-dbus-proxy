@@ -23,7 +23,7 @@
 
 /* Fixed-size little-endian protocol, no host pointers or file descriptors.
  * Tokens travel only on the inherited private channel. */
-enum { CONFIG = 1, BUFFER, READY, FRAME, DONE };
+enum { CONFIG = 1, BUFFER, READY, FRAME, DONE, FLOW };
 struct packet {
     uint32_t magic, op, slot, id, width, height, format, count;
     uint64_t modifier, seq;
@@ -48,7 +48,7 @@ struct slot {
     bool available, pending, imported_ok;
 };
 struct app {
-    bool guest, ready, configured, stopping, streaming;
+    bool guest, ready, configured, stopping, streaming, consumer_active;
     int channel, status, inject, capture, render, result;
     uint32_t count, assigned;
     uint64_t sequence;
@@ -243,6 +243,15 @@ static void guest_process(struct app *a) {
         pw_stream_queue_buffer(a->stream,s->pw);
     }
 }
+/* Never lend the whole producer pool to a slower (or not yet linked) guest.
+ * xdph renegotiates its pool when no buffer is available for the next copy.
+ * Dropping a frame here is safe: it has not been announced to the guest. */
+static bool can_forward_frame(const struct app *a) {
+    if (!a->consumer_active || a->count<2) return false;
+    uint32_t held=0;
+    for(uint32_t i=0;i<a->count;i++) if(a->slots[i].sent_ns) held++;
+    return held<a->count-1;
+}
 static void process(void *data) {
     struct app *a=data; if (a->stopping) return;
     if (a->guest) { guest_process(a); return; }
@@ -252,6 +261,7 @@ static void process(void *data) {
         uint32_t i;
         for(i=0;i<a->count;i++) if(a->slots[i].pw==b) break;
         if(i==a->count || a->slots[i].sent_ns) { errno=EPROTO; fail(a,"unknown or busy host buffer"); return; }
+        if(!can_forward_frame(a)) { pw_stream_queue_buffer(a->stream,b); continue; }
         /* Explicit acquire fences are not negotiated. Never publish unsynchronized buffers. */
         if(spa_buffer_find_meta(b->buffer,SPA_META_SyncTimeline)) { errno=ENOTSUP; fail(a,"explicit-sync capture is not supported yet"); return; }
         struct spa_data *d=b->buffer->datas;
@@ -283,13 +293,16 @@ static void state_changed(void *data, enum pw_stream_state old, enum pw_stream_s
     fprintf(stderr,"vm-capture[%s]: stream %s -> %s%s%s\n",a->guest?"guest":"host",
         pw_stream_state_as_string(old),pw_stream_state_as_string(state),error?": ":"",error?error:"");
     a->streaming=state==PW_STREAM_STATE_STREAMING;
+    if(a->guest && a->ready && !a->stopping &&
+       (state==PW_STREAM_STATE_STREAMING || old==PW_STREAM_STATE_STREAMING))
+        send_packet(a,(struct packet){.op=FLOW,.count=a->streaming});
     if(state==PW_STREAM_STATE_ERROR) { errno=EIO; fail(a,error?error:"PipeWire stream failed"); }
     if(a->guest && state==PW_STREAM_STATE_PAUSED && !a->ready) {
         a->ready=true;
         if(dprintf(a->status,"{\"node\":%u}\n",pw_stream_get_node_id(a->stream))<0) fail(a,"cannot report guest source node");
     }
     if(!a->guest && state==PW_STREAM_STATE_STREAMING && !a->ready) {
-        if(!a->count) { errno=EPROTO; fail(a,"empty capture pool"); return; }
+        if(a->count<2) { errno=EPROTO; fail(a,"capture pool needs at least two buffers"); return; }
         a->ready=true; send_packet(a,(struct packet){.op=READY,.count=a->count});
     }
 }
@@ -311,6 +324,12 @@ static void receive_packet(struct app *a, struct packet p) {
     p.width=le32toh(p.width);p.height=le32toh(p.height);p.format=le32toh(p.format);p.count=le32toh(p.count);
     if(le32toh(p.magic)!=0x31504356 || p.slot>=32) goto invalid;
     if(!a->guest) {
+        if(p.op==FLOW) {
+            if(!a->ready || p.count>1) goto invalid;
+            a->consumer_active=p.count;
+            fprintf(stderr,"vm-capture[host]: guest consumer %s\n",p.count?"streaming":"paused");
+            return;
+        }
         if(p.op!=DONE || p.slot>=a->count || !a->slots[p.slot].sent_ns || a->slots[p.slot].seq!=p.seq) goto invalid;
         a->slots[p.slot].sent_ns=0; pw_stream_queue_buffer(a->stream,a->slots[p.slot].pw); return;
     }

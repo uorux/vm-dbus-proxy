@@ -25,9 +25,14 @@ operation, slot, id, width, height, SPA format, count (eight u32s), modifier and
 sequence (two u64s), 16-byte token. Sequence is monotonically increasing. FRAME reuses id/count as crop x/y,
 width/height as crop size, and format as the SPA video transform (0–7).
 Guest timestamps are stamped on arrival rather than using host monotonic time.
-Operations: CONFIG=1, BUFFER=2, READY=3, FRAME=4, DONE=5. CONFIG precedes up to
+Operations: CONFIG=1, BUFFER=2, READY=3, FRAME=4, DONE=5, FLOW=6. CONFIG precedes up to
 32 BUFFER records, then READY. Each FRAME holds its original host PipeWire
 buffer until the matching DONE arrives after the guest consumer returns it.
+FLOW carries the guest consumer's streaming state in count (0 or 1). Until
+the guest is streaming, host frames are dropped and immediately returned.
+At most pool-size minus one frames may be outstanding; excess frames are also
+dropped so the producer always has a buffer available. This prevents xdph's
+out-of-buffers renegotiation during guest startup or slow consumption.
 A five-second missing acknowledgement terminates the session rather than
 reusing a buffer still owned by a consumer. The channel carries metadata,
 not pixels; imported DMA-BUFs carry pixels.

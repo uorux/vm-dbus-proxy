@@ -1,8 +1,33 @@
 /* Exercise untrusted control decoding without GPU or PipeWire daemon. */
+#include <pipewire/pipewire.h>
+#include <sys/socket.h>
+static struct pw_buffer *test_dequeue(struct pw_stream *stream);
+static int test_queue(struct pw_stream *stream, struct pw_buffer *buffer);
+static ssize_t test_send(int fd, const void *data, size_t length, int flags);
+#define pw_stream_dequeue_buffer test_dequeue
+#define pw_stream_queue_buffer test_queue
+#define send test_send
 #define main capture_program_main
 #include "vm-capture.c"
 #undef main
 #include <assert.h>
+
+static struct pw_buffer *dequeued[32];
+static unsigned dequeue_count, dequeue_next, returned, frames;
+static struct packet last_frame;
+static struct pw_buffer *test_dequeue(struct pw_stream *stream) {
+    (void)stream;
+    return dequeue_next<dequeue_count?dequeued[dequeue_next++]:NULL;
+}
+static int test_queue(struct pw_stream *stream, struct pw_buffer *buffer) {
+    (void)stream;assert(buffer);returned++;return 0;
+}
+static ssize_t test_send(int fd, const void *data, size_t length, int flags) {
+    (void)fd;(void)flags;assert(length==sizeof(struct packet));
+    struct packet p;memcpy(&p,data,length);
+    if(le32toh(p.op)==FRAME) { frames++;last_frame=p; }
+    return length;
+}
 
 static struct app fresh(void) {
     struct app a={.guest=true};
@@ -73,6 +98,39 @@ int main(void) {
     pw_main_loop_destroy(a.loop);
     a=fresh();receive_packet(&a,config(1920,1080));
     f.modifier=123;assert(!accept_format(&a,&f) && a.stopping); /* guest import immutable */
+    pw_main_loop_destroy(a.loop);
+    /* Reproduce xdph's four-buffer bootstrap: recycle all frames until the
+     * guest links, then keep one producer buffer free despite a stalled guest.
+     * Exercise process(), FLOW and DONE together, not just the limit predicate. */
+    a=fresh();a.guest=false;a.ready=true;a.count=4;
+    a.format=(struct spa_video_info_raw){.size=SPA_RECTANGLE(1920,1080)};
+    struct spa_chunk chunks[4];struct spa_data datas[4];
+    struct spa_buffer buffers[4];struct pw_buffer pw_buffers[4];
+    for(unsigned i=0;i<4;i++) {
+        chunks[i]=(struct spa_chunk){.stride=7680,.size=7680*1080};
+        datas[i]=(struct spa_data){.chunk=&chunks[i]};
+        buffers[i]=(struct spa_buffer){.n_datas=1,.datas=&datas[i]};
+        pw_buffers[i]=(struct pw_buffer){.buffer=&buffers[i]};
+        a.slots[i].pw=dequeued[i]=&pw_buffers[i];
+        a.slots[i].imported.strides[0]=7680;
+    }
+    dequeue_count=4;dequeue_next=returned=frames=0;process(&a);
+    assert(!a.stopping && returned==4 && frames==0 && a.sequence==0);
+    p=(struct packet){.magic=htole32(0x31504356),.op=htole32(FLOW),.count=htole32(1)};
+    receive_packet(&a,p);assert(a.consumer_active && !a.stopping);
+    dequeue_next=returned=0;process(&a);
+    assert(!a.stopping && returned==1 && frames==3 && a.sequence==3);
+    assert(!a.slots[3].sent_ns);
+    dequeued[0]=&pw_buffers[3];dequeue_count=1;dequeue_next=0;process(&a);
+    assert(returned==2 && frames==3); /* unacknowledged slots stay held */
+    struct packet done={.magic=htole32(0x31504356),.op=htole32(DONE),.slot=0,.seq=htole64(1)};
+    receive_packet(&a,done);assert(!a.stopping && returned==3 && !a.slots[0].sent_ns);
+    dequeued[0]=&pw_buffers[0];dequeue_next=0;process(&a);
+    assert(frames==4 && le64toh(last_frame.seq)==4 && le32toh(last_frame.slot)==0);
+    p.count=0;receive_packet(&a,p);assert(!a.consumer_active);
+    dequeued[0]=&pw_buffers[3];dequeue_next=0;process(&a);
+    assert(frames==4 && returned==4 && !a.stopping);
+    p.count=htole32(2);receive_packet(&a,p);assert(a.stopping);
     pw_main_loop_destroy(a.loop);
     puts("capture control validation: passed");pw_deinit();return 0;
 }
