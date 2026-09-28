@@ -33,6 +33,11 @@ the guest is streaming, host frames are dropped and immediately returned.
 At most one frame may be outstanding; excess frames are dropped so the
 remaining buffers stay available for the producer and PipeWire graph. A single
 nominally free buffer did not provide enough scheduling headroom on xdph.
+The host receiver also uses synchronous graph processing on its main loop
+(`node.loop.class=main`, `node.async=false`, `PW_STREAM_FLAG_RT_PROCESS`).
+Without that flag PipeWire forces asynchronous processing; the producer can
+run out of buffers even when the bridge forwards only one frame. Callbacks
+remain on the main loop because control-channel I/O is not realtime-safe.
 A five-second missing acknowledgement terminates the session rather than
 reusing a buffer still owned by a consumer. The channel carries metadata,
 not pixels; imported DMA-BUFs carry pixels.

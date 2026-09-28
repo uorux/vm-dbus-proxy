@@ -455,7 +455,15 @@ int main(int argc,char **argv) {
     struct spa_source *tick=pw_loop_add_timer(pw_main_loop_get_loop(a.loop),timer,&a);
     struct timespec interval={.tv_nsec=10000000};pw_loop_update_timer(pw_main_loop_get_loop(a.loop),tick,&interval,&interval,false);
     if(!a.guest) {
-        a.stream=pw_stream_new(a.core,"VM host capture",pw_properties_new(PW_KEY_MEDIA_TYPE,"Video",PW_KEY_MEDIA_CATEGORY,"Capture",NULL));
+        /* A non-RT stream is implicitly node.async=true in PipeWire. For
+         * this externally driven video source that can leave returned buffers
+         * behind the producer's next dequeue. Process synchronously in the
+         * graph, but explicitly on our main loop: process() uses control I/O
+         * and must never run on a realtime data thread. This also serializes
+         * process(), DONE handling and buffer removal. */
+        a.stream=pw_stream_new(a.core,"VM host capture",pw_properties_new(
+            PW_KEY_MEDIA_TYPE,"Video",PW_KEY_MEDIA_CATEGORY,"Capture",
+            PW_KEY_NODE_LOOP_CLASS,"main",PW_KEY_NODE_ASYNC,"false",NULL));
         pw_stream_add_listener(a.stream,&a.listener,&events,&a);
         int drm=open(render,O_RDWR|O_CLOEXEC);
         struct gbm_device *gbm=drm>=0?gbm_create_device(drm):NULL;
@@ -464,7 +472,8 @@ int main(int argc,char **argv) {
         if(display==EGL_NO_DISPLAY)fprintf(stderr,"vm-capture: EGL modifier query unavailable; trying linear buffers\n");
         unsigned char storage[4096];struct spa_pod_builder b=SPA_POD_BUILDER_INIT(storage,sizeof storage);
         const struct spa_pod *params[2]={host_format(&b,SPA_VIDEO_FORMAT_BGRx,display),host_format(&b,SPA_VIDEO_FORMAT_BGRA,display)};
-        int res=pw_stream_connect(a.stream,PW_DIRECTION_INPUT,node,PW_STREAM_FLAG_AUTOCONNECT,params,2);
+        int res=pw_stream_connect(a.stream,PW_DIRECTION_INPUT,node,
+            PW_STREAM_FLAG_AUTOCONNECT|PW_STREAM_FLAG_RT_PROCESS,params,2);
         if(display!=EGL_NO_DISPLAY)eglTerminate(display);
         if(gbm)gbm_device_destroy(gbm);
         if(drm>=0)close(drm);
