@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from vm_dbus_proxy import protocol, proxy
-from helpers import feed, line, stream_pair
+from helpers import feed, line, message, stream_pair
 
 
 class AuthenticationTests(unittest.TestCase):
@@ -47,6 +47,41 @@ class AuthenticationTests(unittest.TestCase):
         self.assertEqual(line(host), b'AUTH EXTERNAL 31303031\r\n')
         self.assertEqual(line(host), b'AUTH EXTERNAL 31303031\r\n')
         self.assertEqual(line(host), b'BEGIN\r\n')
+
+    def test_pipelined_sd_bus_auth_keeps_first_message(self):
+        # sd-bus writes its whole auth exchange and Hello without waiting.
+        hello = message(serial=1, fields={1: ('o', '/org/freedesktop/DBus'),
+                                          2: ('s', 'org.freedesktop.DBus'),
+                                          3: ('s', 'Hello'),
+                                          6: ('s', 'org.freedesktop.DBus')})
+        client, app, upstream, host = self.streams(
+            b'\0AUTH EXTERNAL\r\nDATA\r\nNEGOTIATE_UNIX_FD\r\nBEGIN\r\n' + hello,
+            b'DATA\r\nOK abc\r\n')
+        self.assertTrue(proxy.authenticate(client, upstream))
+        self.assertEqual(line(app), b'DATA\r\n')
+        self.assertEqual(line(app), b'OK abc\r\n')
+        self.assertEqual(line(app), b'AGREE_UNIX_FD\r\n')
+        self.assertEqual(host.recv(1), b'\0')
+        # FD negotiation never reaches the host transport.
+        self.assertEqual(line(host), b'AUTH EXTERNAL\r\n')
+        self.assertEqual(line(host), b'DATA\r\n')
+        self.assertEqual(line(host), b'BEGIN\r\n')
+        self.assertEqual(protocol.read_frame(client).data, hello)
+
+    def test_negotiation_before_ok_is_refused_locally(self):
+        client, app, upstream, host = self.streams(
+            b'\0NEGOTIATE_UNIX_FD\r\nAUTH EXTERNAL 31303031\r\nBEGIN\r\n', b'OK abc\r\n')
+        self.assertFalse(proxy.authenticate(client, upstream))
+        self.assertTrue(line(app).startswith(b'ERROR '))
+        self.assertEqual(host.recv(1), b'\0')
+        self.assertEqual(line(host), b'AUTH EXTERNAL 31303031\r\n')
+
+    def test_upstream_fd_agreement_is_fatal(self):
+        client, app, upstream, host = self.streams(
+            b'\0AUTH EXTERNAL 31303031\r\nNEGOTIATE_UNIX_FD\t\r\n',
+            b'OK abc\r\nAGREE_UNIX_FD\r\n')
+        with self.assertRaisesRegex(protocol.ProtocolError, 'negotiated descriptors'):
+            proxy.authenticate(client, upstream)
 
 
 if __name__ == '__main__':

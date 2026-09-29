@@ -1,7 +1,12 @@
+import errno
 import os
 import queue
+import socket
+import struct
+import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from vm_dbus_proxy import protocol, proxy
 from helpers import feed, line, message, stream_pair
@@ -28,14 +33,15 @@ class BridgeTests(unittest.TestCase):
         self.thread.join(4)
         self.assertFalse(self.thread.is_alive(), 'bridge leaked connection thread')
 
-    def authenticate(self):
+    def authenticate(self, negotiate=True):
         self.client.sendall(b'\0AUTH EXTERNAL 31303031\r\n')
         self.assertEqual(self.server.recv(1), b'\0')
         self.assertEqual(line(self.server), b'AUTH EXTERNAL 31303031\r\n')
         self.server.sendall(b'OK 0123456789abcdef0123456789abcdef\r\n')
         self.assertTrue(line(self.client).startswith(b'OK '))
-        self.client.sendall(b'NEGOTIATE_UNIX_FD\r\n')
-        self.assertEqual(line(self.client), b'AGREE_UNIX_FD\r\n')
+        if negotiate:
+            self.client.sendall(b'NEGOTIATE_UNIX_FD\r\n')
+            self.assertEqual(line(self.client), b'AGREE_UNIX_FD\r\n')
         # BEGIN must be the very next upstream command: FD agreement is local.
         self.client.sendall(b'BEGIN\r\n')
         self.assertEqual(line(self.server), b'BEGIN\r\n')
@@ -104,11 +110,106 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaises(OSError):
             os.fstat(descriptor)
 
+    def assert_disconnected(self):
+        self.thread.join(3)
+        self.assertFalse(self.thread.is_alive())
+        self.assertEqual(self.client.recv(1), b'')
+
+    def test_fd_calls_get_distinct_error_serials(self):
+        self.authenticate()
+        serials = []
+        for serial in (70, 71):
+            self.send_fd(serial=serial)
+            error = protocol.read_frame(self.client)
+            self.assertEqual(error.fields[5], serial)
+            serials.append(error.serial)
+        self.assertNotEqual(serials[0], serials[1])
+
+    def test_descriptors_without_negotiation_disconnect(self):
+        self.authenticate(negotiate=False)
+        descriptor = self.send_fd()
+        self.assert_disconnected()
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+
+    def test_upstream_unix_fds_header_disconnects(self):
+        self.authenticate()
+        # The host transport cannot carry descriptors, so a declared count
+        # without descriptors is a broken or hostile peer.
+        self.server.sendall(message(kind=4, serial=5, fields={
+            1: ('o', '/test'), 2: ('s', 'org.example.Test'), 3: ('s', 'Signal'),
+            9: ('u', 1)}))
+        self.assert_disconnected()
+
+    def test_oversized_client_frame_disconnects_before_body(self):
+        self.authenticate()
+        data = bytearray(message(serial=60))
+        struct.pack_into('<I', data, 4, 64 * 1024 * 1024)
+        self.client.sendall(bytes(data[:16]))
+        self.assert_disconnected()
+
     def test_begin_before_authentication_fails(self):
         self.client.sendall(b'\0BEGIN\r\n')
         self.thread.join(3)
         self.assertFalse(self.thread.is_alive())
         self.assertEqual(self.client.recv(1), b'')
+
+
+class ServeTests(unittest.TestCase):
+    def test_accept_failure_does_not_stop_listener(self):
+        class Stop(BaseException):
+            pass
+
+        directory = tempfile.mkdtemp(prefix='vdp', dir='/tmp')
+        listen, upstream = directory + '/bus', directory + '/up'
+        host = socket.socket(socket.AF_UNIX)
+        host.bind(upstream)
+        host.listen(1)
+        host.settimeout(5)
+        release = threading.Event()
+        real_accept = socket.socket.accept
+        calls = []
+
+        def accept(sock):
+            calls.append(None)
+            if len(calls) == 1:
+                raise OSError(errno.EMFILE, 'Too many open files')
+            if len(calls) == 3:
+                release.wait(5)
+                raise Stop()
+            return real_accept(sock)
+
+        def run():
+            try:
+                proxy.serve(listen, upstream)
+            except Stop:
+                pass
+
+        with patch.object(socket.socket, 'accept', accept):
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            try:
+                for _ in range(100):
+                    if os.path.exists(listen):
+                        break
+                    threading.Event().wait(0.02)
+                with socket.socket(socket.AF_UNIX) as app:
+                    app.settimeout(5)
+                    app.connect(listen)
+                    app.sendall(b'\0AUTH EXTERNAL 31303031\r\n')
+                    server, _ = real_accept(host)
+                    with server:
+                        server.settimeout(5)
+                        self.assertEqual(server.recv(1), b'\0')
+                        self.assertEqual(line(server), b'AUTH EXTERNAL 31303031\r\n')
+            finally:
+                release.set()
+                thread.join(5)
+                host.close()
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(os.path.exists(listen))
+        os.unlink(upstream)
+        os.rmdir(directory)
 
 
 if __name__ == '__main__':

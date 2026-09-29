@@ -57,7 +57,19 @@ host transport; the adapter does not invent identities or grant permissions.
 Frames default to at most 32 MiB, headers to 1 MiB, descriptors to 256 per frame,
 and concurrent clients to 128. `--max-message-bytes` adjusts the frame cap up to
 128 MiB. Oversized or malformed traffic disconnects that client. Buffers are
-bounded per connection; these limits are not a total memory budget.
+bounded per connection; these limits are not a total memory budget. A guest
+app can still exhaust the adapter's slots or memory for other apps in the same
+VM; the host and other VMs are unaffected. Accept failures (for example,
+descriptor exhaustion) are logged and retried rather than stopping the service.
+
+What it cannot fix: a host method whose *reply* carries a descriptor (for
+example, `OpenPipeWireRemote` without the capture bridge, or anything returning
+`h`). The host bus sees a connection without FD support and refuses to deliver
+that reply, so the app's call should time out instead of failing fast. The
+app's own FD-bearing messages are the only ones the adapter can turn into
+errors. A synthesized error
+may also overtake replies to earlier calls; that includes `Hello` only if a
+client sends an FD-bearing call before its `Hello` reply arrives.
 
 ## Tests
 
@@ -66,8 +78,10 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
 Tests cover framing, descriptor cleanup, authentication, transparent forwarding,
-and unsupported-call responses. The private dbus-daemon integration test needs
-Unix socket permissions and skips when the environment prohibits sockets. CI
+and unsupported-call responses. The private dbus-daemon integration tests need
+Unix socket permissions and a passwd entry for the current uid, and skip
+otherwise. They pass a real descriptor through the kernel and check the adapter
+keeps no copy. CI
 runs the suite on Linux with dbus installed. A passing unit suite does not
 substitute for a Chromium launch and host-portal test in the actual VM.
 

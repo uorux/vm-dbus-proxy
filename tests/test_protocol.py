@@ -125,6 +125,24 @@ class FramingTests(unittest.TestCase):
             self.assertEqual(reply.fields[4], 'org.freedesktop.DBus.Error.NotSupported')
             self.assertEqual(reply.fd_count, 0)
 
+    def test_signature_nesting_limits_are_per_kind(self):
+        # 32 arrays plus 32 structures is valid D-Bus; 33 of either is not.
+        deep = 'a' * 32 + '(' * 32 + 'y' + ')' * 32
+        self.assertEqual(len(protocol.signature_types(deep)), 1)
+        for bad in ('a' * 33 + 'y', '(' * 33 + 'y' + ')' * 33):
+            with self.subTest(bad=bad[:40]), self.assertRaises(protocol.ProtocolError):
+                protocol.signature_types(bad)
+
+    def test_deep_body_signature_header_is_accepted(self):
+        signature = 'a' * 20 + '(' * 20 + 's' + ')' * 20
+        data = message(fields={1: ('o', '/test'), 3: ('s', 'Ping'), 8: ('g', signature)})
+        self.assertEqual(self.read(data).fields[8], signature)
+
+    def test_error_to_host_caller_keeps_destination(self):
+        reply = self.read(message(kind=2, serial=66, fields={5: ('u', 32), 6: ('s', ':1.17')}))
+        error = self.read(protocol.make_error(reply, serial=66))
+        self.assertEqual((error.serial, error.fields[5], error.fields[6]), (66, 32, ':1.17'))
+
 
 if __name__ == '__main__':
     unittest.main()

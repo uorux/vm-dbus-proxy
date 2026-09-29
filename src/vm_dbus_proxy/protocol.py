@@ -68,14 +68,16 @@ def exact(sock, size, allow_eof=False):
 
 def signature_types(signature):
     """Parse a D-Bus signature, including unknown header field value types."""
-    def one(pos, depth, dictionary=False):
-        if depth > 32 or pos >= len(signature):
+    # The specification limits array and structure (including dict entry)
+    # nesting to 32 each, not 32 combined; valid body signatures reach 64.
+    def one(pos, arrays, structs, dictionary=False):
+        if arrays > 32 or structs > 32 or pos >= len(signature):
             raise ProtocolError("invalid type signature")
         char = signature[pos]
         if char in "ybnqiuxtdhsogv":
             return char, pos + 1
         if char == "a":
-            item, end = one(pos + 1, depth + 1, True)
+            item, end = one(pos + 1, arrays + 1, structs, True)
             return ("a", item), end
         if char in "({":
             if char == "{" and not dictionary:
@@ -84,7 +86,7 @@ def signature_types(signature):
             parts = []
             pos += 1
             while pos < len(signature) and signature[pos] != end_char:
-                item, pos = one(pos, depth + 1)
+                item, pos = one(pos, arrays, structs + 1)
                 parts.append(item)
             if not parts or pos >= len(signature):
                 raise ProtocolError("unterminated or empty structure")
@@ -99,7 +101,7 @@ def signature_types(signature):
     out = []
     pos = 0
     while pos < len(signature):
-        item, pos = one(pos, 0)
+        item, pos = one(pos, 0, 0)
         out.append(item)
     return out
 
@@ -126,7 +128,8 @@ class HeaderReader:
         return struct.unpack(self.endian + fmt, self.take(struct.calcsize(fmt)))[0]
 
     def value(self, kind, depth=0):
-        if depth > 32:
+        # Total nesting including variants is limited to 64 by the specification.
+        if depth > 64:
             raise ProtocolError("header nesting too deep")
         tag = kind if isinstance(kind, str) else kind[0]
         self.align({"y": 1, "g": 1, "v": 1, "n": 2, "q": 2,

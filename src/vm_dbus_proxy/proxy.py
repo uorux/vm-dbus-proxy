@@ -1,8 +1,10 @@
 """Transparent per-connection proxy; the host remains the bus and policy owner."""
 
 import argparse
+import errno
 import logging
 import os
+import resource
 import socket
 import threading
 import time
@@ -131,7 +133,7 @@ def bridge(client, upstream, max_message_bytes=MAX_MESSAGE_BYTES):
             if frame.fd_count:
                 if not negotiated:
                     raise ProtocolError("client sent descriptors without negotiation")
-                LOG.info("unsupported descriptor message: type=%s member=%s count=%s",
+                LOG.info("unsupported descriptor message: type=%s member=%r count=%s",
                          frame.message_type, frame.fields.get(3, ""), frame.fd_count)
                 if frame.message_type == 1 and not frame.flags & 1:
                     with client_write:
@@ -156,6 +158,17 @@ def bridge(client, upstream, max_message_bytes=MAX_MESSAGE_BYTES):
         upstream.close()
 
 
+def raise_fd_limit():
+    """Received descriptors are installed before they can be closed (up to 253
+    per message), so a low soft limit would turn bursts into accept failures."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (OSError, ValueError) as exc:
+        LOG.debug("cannot raise descriptor limit: %s", exc)
+
+
 def serve(listen, upstream, max_message_bytes=MAX_MESSAGE_BYTES):
     """Listen only on a guest Unix socket, forwarding to its existing relay."""
     if os.path.lexists(listen):
@@ -169,8 +182,10 @@ def serve(listen, upstream, max_message_bytes=MAX_MESSAGE_BYTES):
     slots = threading.BoundedSemaphore(128)
 
     def handle(client):
-        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection = None
         try:
+            # Inside the try: descriptor exhaustion must not leak the slot.
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             deadline = time.monotonic() + 5
             while True:
                 try:
@@ -185,17 +200,31 @@ def serve(listen, upstream, max_message_bytes=MAX_MESSAGE_BYTES):
             LOG.warning("cannot connect to upstream: %s", exc)
         finally:
             client.close()
-            connection.close()
+            if connection is not None:
+                connection.close()
             slots.release()
 
     LOG.info("listening on %s", listen)
     try:
         while True:
-            client, _ = listener.accept()
+            # One client exhausting descriptors or threads must not end the
+            # accept loop: that would disconnect every app in the guest.
+            try:
+                client, _ = listener.accept()
+            except OSError as exc:
+                LOG.warning("accept failed: %s", exc)
+                if exc.errno in (errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM):
+                    time.sleep(0.1)
+                continue
             if not slots.acquire(blocking=False):
                 client.close()
                 continue
-            threading.Thread(target=handle, args=(client,), daemon=True).start()
+            try:
+                threading.Thread(target=handle, args=(client,), daemon=True).start()
+            except RuntimeError as exc:
+                LOG.warning("cannot start connection thread: %s", exc)
+                client.close()
+                slots.release()
     finally:
         listener.close()
         os.unlink(listen)
@@ -211,4 +240,5 @@ def main():
     if not 16 <= args.max_message_bytes <= 128 * 1024 * 1024:
         parser.error("message limit must be between 16 bytes and 128 MiB")
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+    raise_fd_limit()
     serve(args.listen, args.upstream, args.max_message_bytes)

@@ -53,7 +53,12 @@ class Stream:
         return self.recvmsg(size)[0]
 
     def shutdown(self, how):
-        self.peer.incoming.put((b'', [], 0))
+        # Like a real socket: SHUT_WR ends the peer's reads and SHUT_RD wakes
+        # our own blocked reader with EOF.
+        if how in (socket.SHUT_WR, socket.SHUT_RDWR):
+            self.peer.incoming.put((b'', [], 0))
+        if how in (socket.SHUT_RD, socket.SHUT_RDWR):
+            self.incoming.put((b'', [], 0))
 
     def close(self):
         if not self.closed:
