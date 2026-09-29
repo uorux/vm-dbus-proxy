@@ -38,11 +38,21 @@ struct inj_import {
     uint32_t op, planes, width, height, fourcc, flags;
     uint64_t modifier; uint32_t offsets[4], strides[4];
 };
+/* virtio-nvgpu protocol/src/inject.rs: 64-byte IMPORT, 48-byte reply. */
+_Static_assert(sizeof(struct inj_import) == 64, "inject IMPORT");
+_Static_assert(sizeof(struct inj_reply) == 48, "inject reply");
+/* A frame the guest has not returned within this long is taken back and
+ * requeued to the producer (DEPLOY.md "Capture injection", step 4). The
+ * guest may still be reading it; that tears only its own copy. */
+#define RECLAIM_NS 500000000ULL
 struct slot {
     struct pw_buffer *pw;
     struct nvgpu_capture_open imported;
     uint32_t id;
-    uint64_t seq, sent_ns;
+    /* host: seq of the frame held by the guest (while sent_ns != 0).
+     * guest: seq of the frame waiting to be queued (while pending), and
+     * queued_seq of the one lent to consumers (while sent_ns != 0). */
+    uint64_t seq, sent_ns, queued_seq;
     struct spa_region crop;
     uint32_t transform;
     bool available, pending, imported_ok;
@@ -50,7 +60,7 @@ struct slot {
 struct app {
     bool guest, ready, configured, stopping, streaming, consumer_active;
     int channel, status, inject, capture, render, result;
-    uint32_t count, assigned;
+    uint32_t count, reclaimed;
     uint64_t sequence;
     struct pw_main_loop *loop;
     struct pw_context *context;
@@ -173,8 +183,12 @@ static void add_buffer(void *data, struct pw_buffer *b) {
     struct app *a=data; struct spa_buffer *buf=b->buffer;
     if (a->stopping) return;
     if (a->guest) {
-        if (a->assigned>=a->count || buf->n_datas!=1) { errno=EPROTO; fail(a,"invalid guest buffer count"); return; }
-        struct slot *s=&a->slots[a->assigned++]; s->pw=b;
+        /* Buffers come back after a consumer relinks: take any free slot. */
+        uint32_t n=0;
+        while (n<a->count && a->slots[n].pw) n++;
+        if (n==a->count || buf->n_datas!=1) { errno=EPROTO; fail(a,"invalid guest buffer count"); return; }
+        struct slot *s=&a->slots[n]; s->pw=b;
+        s->available=false; s->pending=false; s->sent_ns=0;
         struct spa_data *d=buf->datas;
         if (!(d->type & (1<<SPA_DATA_DmaBuf))) { errno=ENOTSUP; fail(a,"guest consumer needs DMA-BUF support"); return; }
         d->type=SPA_DATA_DmaBuf; d->flags=SPA_DATA_FLAG_READABLE;
@@ -210,8 +224,23 @@ static void add_buffer(void *data, struct pw_buffer *b) {
     a->count++;
     struct packet p={.op=BUFFER,.slot=n,.id=s->id}; memcpy(p.token,r.token,16); send_packet(a,p);
 }
+/* guest: a frame the consumers will never see again goes straight back. */
+static void guest_release(struct app *a, uint32_t i) {
+    struct slot *s=&a->slots[i];
+    if (!a->stopping && s->sent_ns) send_packet(a,(struct packet){.op=DONE,.slot=i,.seq=s->queued_seq});
+    if (!a->stopping && s->pending) send_packet(a,(struct packet){.op=DONE,.slot=i,.seq=s->seq});
+    s->sent_ns=0; s->pending=false;
+}
 static void remove_buffer(void *data, struct pw_buffer *b) {
     struct app *a=data;
+    if (a->guest) {
+        /* A consumer unlinked (or relinks): release the slot, not the share.
+         * The imported DMA-BUF stays open for the slot's next add_buffer. */
+        for (uint32_t i=0;i<a->count;i++) if (a->slots[i].pw==b) {
+            guest_release(a,i); a->slots[i].pw=NULL; a->slots[i].available=false;
+        }
+        return;
+    }
     if (!a->stopping) {
         uint32_t i;
         for(i=0;i<a->count;i++) if(a->slots[i].pw==b) break;
@@ -226,7 +255,7 @@ static void guest_process(struct app *a) {
     while ((b=pw_stream_dequeue_buffer(a->stream))) {
         for (uint32_t i=0;i<a->count;i++) if (a->slots[i].pw==b) {
             struct slot *s=&a->slots[i];
-            if (s->sent_ns) { send_packet(a,(struct packet){.op=DONE,.slot=i,.seq=s->seq}); s->sent_ns=0; }
+            if (s->sent_ns) { send_packet(a,(struct packet){.op=DONE,.slot=i,.seq=s->queued_seq}); s->sent_ns=0; }
             s->available=true; break;
         }
     }
@@ -239,7 +268,7 @@ static void guest_process(struct app *a) {
         struct spa_meta_videotransform *transform=spa_buffer_find_meta_data(s->pw->buffer,SPA_META_VideoTransform,sizeof *transform);
         if(crop)crop->region=s->crop;
         if(transform)transform->transform=s->transform;
-        s->pending=false; s->available=false; s->sent_ns=now_ns();
+        s->pending=false; s->available=false; s->sent_ns=now_ns(); s->queued_seq=s->seq;
         pw_stream_queue_buffer(a->stream,s->pw);
     }
 }
@@ -296,8 +325,14 @@ static void state_changed(void *data, enum pw_stream_state old, enum pw_stream_s
         pw_stream_state_as_string(old),pw_stream_state_as_string(state),error?": ":"",error?error:"");
     a->streaming=state==PW_STREAM_STATE_STREAMING;
     if(a->guest && a->ready && !a->stopping &&
-       (state==PW_STREAM_STATE_STREAMING || old==PW_STREAM_STATE_STREAMING))
+       (state==PW_STREAM_STATE_STREAMING || old==PW_STREAM_STATE_STREAMING)) {
         send_packet(a,(struct packet){.op=FLOW,.count=a->streaming});
+        /* Frames not yet lent to a consumer will not be: return them now
+         * instead of letting the host wait for its reclaim timeout. */
+        if(!a->streaming) for(uint32_t i=0;i<a->count && !a->stopping;i++) if(a->slots[i].pending) {
+            send_packet(a,(struct packet){.op=DONE,.slot=i,.seq=a->slots[i].seq}); a->slots[i].pending=false;
+        }
+    }
     if(state==PW_STREAM_STATE_ERROR) { errno=EIO; fail(a,error?error:"PipeWire stream failed"); }
     if(a->guest && state==PW_STREAM_STATE_PAUSED && !a->ready) {
         a->ready=true;
@@ -328,11 +363,14 @@ static void receive_packet(struct app *a, struct packet p) {
     if(!a->guest) {
         if(p.op==FLOW) {
             if(!a->ready || p.count>1) goto invalid;
+            if(a->consumer_active!=(bool)p.count)
+                fprintf(stderr,"vm-capture[host]: guest consumer %s\n",p.count?"streaming":"paused");
             a->consumer_active=p.count;
-            fprintf(stderr,"vm-capture[host]: guest consumer %s\n",p.count?"streaming":"paused");
             return;
         }
-        if(p.op!=DONE || p.slot>=a->count || !a->slots[p.slot].sent_ns || a->slots[p.slot].seq!=p.seq) goto invalid;
+        if(p.op!=DONE || p.slot>=a->count || !p.seq || p.seq>a->sequence) goto invalid;
+        /* A DONE for a frame already reclaimed after the timeout is stale. */
+        if(!a->slots[p.slot].sent_ns || a->slots[p.slot].seq!=p.seq) return;
         a->slots[p.slot].sent_ns=0; pw_stream_queue_buffer(a->stream,a->slots[p.slot].pw); return;
     }
     if(p.op==CONFIG && !a->configured) {
@@ -357,12 +395,19 @@ static void receive_packet(struct app *a, struct packet p) {
     }
     if(p.op==FRAME && a->stream && p.slot<a->count) {
         struct slot *s=&a->slots[p.slot];
-        if(s->pending || s->sent_ns || !p.seq || p.seq<=a->sequence) goto invalid;
+        if(!p.seq || p.seq<=a->sequence) goto invalid;
         if(!p.width || !p.height || (uint64_t)p.id+p.width>a->format.size.width ||
            (uint64_t)p.count+p.height>a->format.size.height || p.format>7)goto invalid;
+        a->sequence=p.seq;
+        /* The host re-announces a slot only after taking the previous frame
+         * back (DONE or its timeout); this one supersedes a pending one. A
+         * slot still lent to a consumer is queued again once returned. */
+        if(!a->streaming || !s->pw) {
+            send_packet(a,(struct packet){.op=DONE,.slot=p.slot,.seq=p.seq}); return;
+        }
         s->crop=SPA_REGION(p.id,p.count,p.width,p.height);s->transform=p.format;
-        a->sequence=p.seq;s->seq=p.seq;s->pending=true;
-        if(a->streaming)pw_stream_trigger_process(a->stream);
+        s->seq=p.seq;s->pending=true;
+        pw_stream_trigger_process(a->stream);
         return;
     }
 invalid:
@@ -383,8 +428,11 @@ static void channel_ready(void *data, int fd, uint32_t mask) {
 static void timer(void *data,uint64_t count) {
     struct app *a=data;(void)count;
     if(a->guest) { if(a->stream && a->streaming)pw_stream_trigger_process(a->stream); return; }
-    for(uint32_t i=0;i<a->count;i++) if(a->slots[i].sent_ns && now_ns()-a->slots[i].sent_ns>5000000000ULL) {
-        errno=ETIMEDOUT;fail(a,"guest did not return capture buffer within five seconds");return;
+    for(uint32_t i=0;i<a->count;i++) if(a->slots[i].sent_ns && now_ns()-a->slots[i].sent_ns>RECLAIM_NS) {
+        /* Never let the guest keep a producer buffer: take it back. */
+        if(!(a->reclaimed & (a->reclaimed-1)))
+            fprintf(stderr,"vm-capture[host]: guest held a frame too long; reclaimed (%u so far)\n",a->reclaimed+1);
+        a->reclaimed++; a->slots[i].sent_ns=0; pw_stream_queue_buffer(a->stream,a->slots[i].pw);
     }
 }
 static void quit(void *data,int sig) {struct app *a=data;(void)sig;a->stopping=true;pw_main_loop_quit(a->loop);}
@@ -416,7 +464,7 @@ static const struct spa_pod *host_format(struct spa_pod_builder *b, uint32_t for
 }
 int main(int argc,char **argv) {
     struct app a={.channel=-1,.status=-1,.inject=-1,.capture=-1,.render=-1};
-    const char *inject=NULL,*render="/dev/dri/renderD128",*capture="/dev/nvgpu-capture";int pwfd=-1;uint32_t node=PW_ID_ANY;
+    const char *inject=NULL,*render="/dev/dri/renderD128",*capture="/dev/nvgpu-capture";int pwfd=-1,capturefd=-1;uint32_t node=PW_ID_ANY;
     if(argc<2 || (strcmp(argv[1],"host") && strcmp(argv[1],"guest"))) return 2;
     a.guest=!strcmp(argv[1],"guest");
     for(int i=2;i+1<argc;i+=2) {
@@ -427,13 +475,18 @@ int main(int argc,char **argv) {
         else if(!strcmp(argv[i],"--inject-socket"))inject=argv[i+1];
         else if(!strcmp(argv[i],"--render-node"))render=argv[i+1];
         else if(!strcmp(argv[i],"--capture-device"))capture=argv[i+1];
+        /* An already-open /dev/nvgpu-capture (e.g. systemd OpenFile=), so the
+         * account running the private PipeWire needs no access to the node. */
+        else if(!strcmp(argv[i],"--capture-fd"))capturefd=atoi(argv[i+1]);
         else return 2;
     }
     if(a.channel<0 || (a.guest?a.status<0:pwfd<0 || !inject || node==PW_ID_ANY)) return 2;
     signal(SIGPIPE,SIG_IGN);pw_init(NULL,NULL);a.loop=pw_main_loop_new(NULL);
     if(!a.loop)return 1;
     if(a.guest) {
-        a.capture=open(capture,O_RDWR|O_CLOEXEC);a.render=open(render,O_RDWR|O_CLOEXEC);
+        if(capturefd>=0 && fcntl(capturefd,F_SETFD,FD_CLOEXEC)==0)a.capture=capturefd;
+        else if(capturefd<0)a.capture=open(capture,O_RDWR|O_CLOEXEC);
+        a.render=open(render,O_RDWR|O_CLOEXEC);
         if(a.capture<0 || a.render<0){perror("vm-capture: capture device");return 1;}
     } else {
         struct sockaddr_un addr={.sun_family=AF_UNIX};
@@ -444,6 +497,7 @@ int main(int argc,char **argv) {
         if(a.inject<0 || connect(a.inject,(void *)&addr,sizeof addr)<0){perror("vm-capture: inject connect");return 1;}
         uint32_t hello[4]={htole32(1),htole32(1),0,0};struct inj_reply reply;
         if(inject_request(&a,hello,sizeof hello,NULL,0,&reply)<0){perror("vm-capture: inject hello");return 1;}
+        if(le32toh(reply.version)!=1){fprintf(stderr,"vm-capture: unsupported inject protocol version %u\n",le32toh(reply.version));return 1;}
     }
     a.context=pw_context_new(pw_main_loop_get_loop(a.loop),NULL,0);
     a.core=a.guest?pw_context_connect(a.context,NULL,0):pw_context_connect_fd(a.context,pwfd,NULL,0);

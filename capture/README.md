@@ -6,6 +6,9 @@ announces frames on a private control channel. `vm-capture guest` opens those
 imports through `/dev/nvgpu-capture` and publishes them as a PipeWire video
 source. The broker creates a private PipeWire daemon and policy manager per
 session; its connected client socket and source node are returned to the app.
+That daemon loads only the native protocol, client-node, link and metadata
+modules: no factory that loads SPA plugins by a client-chosen `library.name`
+(spa-node-factory, adapter), since the app's client is unrestricted there.
 
 ```
 vm-capture host --control-fd FD --pipewire-fd FD --node-id ID --inject-socket PATH
@@ -13,12 +16,24 @@ vm-capture guest --control-fd FD --status-fd FD
 ```
 
 Both accept `--render-node PATH` (default `/dev/dri/renderD128`); guest accepts
-`--capture-device PATH`. The guest uses `XDG_RUNTIME_DIR` and `PIPEWIRE_REMOTE`
+`--capture-device PATH`, or `--capture-fd FD` for an already-open node (the
+guest broker's `--capture-fd`, e.g. from systemd `OpenFile=`, is handed to
+publishers only, so the account running the private PipeWire need not be in
+group `nvgpu-capture`). The guest uses `XDG_RUNTIME_DIR` and `PIPEWIRE_REMOTE`
 to find its private daemon and writes `{"node":123}\n` to the status pipe.
 Descriptors, including the control channel, are inherited explicitly by the
 broker. No buffer token appears in arguments, environment or logs. Host runs
 as the VM's distinct injection uid. Guest runs as a capture account, not the
 app user. Closing either side ends the session and releases the imports.
+
+What the tokens do and do not protect: the control channel is relayed by the
+two D-Bus capture adapters, so tokens pass through the desktop user's host
+adapter and the guest adapter, which runs as the app's uid. The guest broker
+also accepts that uid. An app in the VM can therefore learn its own streams'
+tokens and have the capture account open them, which gives it nothing beyond
+the pixels it was already sent. Every buffer injected into a VM was approved
+in the host picker for an app of that VM, so no other stream is exposed; the
+tokens do not separate two apps sharing one VM (they share a uid anyway).
 
 The control protocol is 64-byte little-endian records: magic `0x31504356`,
 operation, slot, id, width, height, SPA format, count (eight u32s), modifier and
@@ -27,9 +42,17 @@ width/height as crop size, and format as the SPA video transform (0–7).
 Guest timestamps are stamped on arrival rather than using host monotonic time.
 Operations: CONFIG=1, BUFFER=2, READY=3, FRAME=4, DONE=5, FLOW=6. CONFIG precedes up to
 32 BUFFER records, then READY. Each FRAME holds its original host PipeWire
-buffer until the matching DONE arrives after the guest consumer returns it.
+buffer until the matching DONE arrives after the guest consumer returns it,
+or for at most 500 ms: the host then takes the buffer back and requeues it to
+the producer (DEPLOY.md step 4). A later DONE for that frame is stale and
+ignored; a DONE for a sequence never sent ends the session. The guest may
+then receive a FRAME for a slot a consumer still holds; it answers the old
+frame's DONE when the buffer comes back and lends the new one.
 FLOW carries the guest consumer's streaming state in count (0 or 1). Until
-the guest is streaming, host frames are dropped and immediately returned.
+the guest is streaming, host frames are dropped and immediately returned; a
+frame that reaches a guest that is not streaming is returned at once, and
+frames waiting when the consumer stops are returned too. A consumer that
+unlinks only returns its buffers to the publisher; relinking reuses them.
 At most one frame may be outstanding; excess frames are dropped so the
 remaining buffers stay available for the producer and PipeWire graph. A single
 nominally free buffer did not provide enough scheduling headroom on xdph.
@@ -38,9 +61,12 @@ The host receiver also uses synchronous graph processing on its main loop
 Without that flag PipeWire forces asynchronous processing; the producer can
 run out of buffers even when the bridge forwards only one frame. Callbacks
 remain on the main loop because control-channel I/O is not realtime-safe.
-A five-second missing acknowledgement terminates the session rather than
-reusing a buffer still owned by a consumer. The channel carries metadata,
-not pixels; imported DMA-BUFs carry pixels.
+The reclaim timeout means a stalled guest consumer can see a buffer
+overwritten while it still reads it: tearing in the guest's own copy, never
+another stream's pixels. DONE is sent when the consumer returns the buffer,
+without waiting for GPU work it may still have queued on it (no fences are
+exchanged), with the same effect. The channel carries metadata, not pixels;
+imported DMA-BUFs carry pixels.
 
 Current scope: one packed BGRA/BGRx video stream, at most 8192x8192, one plane
 per buffer. Host EGL modifier discovery uses the configured render device,

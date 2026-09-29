@@ -5,6 +5,7 @@ The authenticated adapter owns the lifetime of each broker connection.
 """
 import argparse
 import array
+import errno
 import json
 import logging
 import os
@@ -21,6 +22,31 @@ from contextlib import ExitStack
 LOG = logging.getLogger(__name__)
 MAX_SESSIONS = 4
 MAX_REQUEST = 4096
+# A private PipeWire per approved share: the protocol server, client nodes
+# (the publisher and the app's consumer are both streams), links and metadata
+# for WirePlumber. No factory that loads SPA plugins by client-chosen name
+# (spa-node-factory, adapter: both honour `library.name`), no device monitors,
+# no host socket. The app gets an unrestricted client of this instance only
+# (per socket: the deprecated access.force was ignored, falling back to
+# flatpak detection).
+PIPEWIRE_CONF = '''context.properties = { core.daemon = true core.name = pipewire-0 }
+context.spa-libs = { support.* = support/libspa-support }
+context.modules = [
+ { name = libpipewire-module-protocol-native }
+ { name = libpipewire-module-client-node }
+ { name = libpipewire-module-link-factory }
+ { name = libpipewire-module-metadata }
+ { name = libpipewire-module-access args = { access.socket = { pipewire-0 = unrestricted pipewire-0-manager = unrestricted } } }
+]
+'''
+WIREPLUMBER_CONF = '''wireplumber.profiles = {
+ capture = {
+  inherits = [ policy, mixin.systemwide-session, mixin.stateless ]
+  support.dbus = disabled
+  support.system-dbus = disabled
+ }
+}
+'''
 
 
 def receive_request(conn):
@@ -134,43 +160,30 @@ def serve_session(conn, args):
             env = dict(os.environ, XDG_RUNTIME_DIR=directory, PIPEWIRE_RUNTIME_DIR=directory,
                        PIPEWIRE_REMOTE='pipewire-0', XDG_CONFIG_HOME=directory,
                        XDG_STATE_HOME=directory, XDG_CACHE_HOME=directory)
-            # Only a private protocol server, client nodes and link factory. No
-            # hardware monitors or host PipeWire socket exist in this instance.
             config = os.path.join(directory, 'pipewire.conf')
             with open(config, 'w') as out:
-                out.write('''context.properties = { core.daemon = true core.name = pipewire-0 }
-context.spa-libs = { support.* = support/libspa-support audio.convert.* = audioconvert/libspa-audioconvert }
-context.modules = [
- { name = libpipewire-module-protocol-native }
- { name = libpipewire-module-client-node }
- { name = libpipewire-module-adapter }
- { name = libpipewire-module-link-factory }
- { name = libpipewire-module-metadata }
- { name = libpipewire-module-spa-node-factory }
- { name = libpipewire-module-access args = { access.force = unrestricted } }
-]
-''')
+                out.write(PIPEWIRE_CONF)
             pipewire = start(stack, [args.pipewire, '-c', config], env=env)
             processes.append(pipewire)
             application = wait_socket(os.path.join(directory, 'pipewire-0'), pipewire)
             stack.callback(application.close)
             os.makedirs(os.path.join(directory, 'wireplumber', 'wireplumber.conf.d'))
             with open(os.path.join(directory, 'wireplumber', 'wireplumber.conf.d', 'capture.conf'), 'w') as out:
-                out.write('''wireplumber.profiles = {
- capture = {
-  inherits = [ policy, mixin.systemwide-session, mixin.stateless ]
-  support.dbus = disabled
-  support.system-dbus = disabled
- }
-}
-''')
+                out.write(WIREPLUMBER_CONF)
             processes.append(start(stack, [args.wireplumber, '--profile', 'capture'], env=env))
             readfd, writefd = os.pipe2(os.O_CLOEXEC)
             stack.callback(os.close, readfd)
+            command = [args.worker, 'guest', '--control-fd', str(fds[0]),
+                       '--status-fd', str(writefd), '--render-node', args.render_node,
+                       '--capture-device', args.capture_device]
+            inherited = [fds[0], writefd]
+            if args.capture_fd is not None:
+                # Only the publisher gets the node; PipeWire and WirePlumber
+                # (close_fds) do not.
+                command += ['--capture-fd', str(args.capture_fd)]
+                inherited.append(args.capture_fd)
             try:
-                publisher = start(stack, [args.worker, 'guest', '--control-fd', str(fds[0]),
-                    '--status-fd', str(writefd), '--render-node', args.render_node,
-                    '--capture-device', args.capture_device], fds=[fds[0], writefd], env=env)
+                publisher = start(stack, command, fds=inherited, env=env)
             finally:
                 os.close(writefd)
             processes.append(publisher)
@@ -205,6 +218,8 @@ def main():
     parser.add_argument('--wireplumber')
     parser.add_argument('--render-node', default='/dev/dri/renderD128')
     parser.add_argument('--capture-device', default='/dev/nvgpu-capture')
+    parser.add_argument('--capture-fd', type=int,
+                        help='an inherited open /dev/nvgpu-capture (systemd OpenFile=), passed to publishers only')
     args = parser.parse_args()
     if args.role == 'host' and not args.inject_socket:
         parser.error('--inject-socket is required on the host')
@@ -227,7 +242,13 @@ def main():
         os.chmod(args.listen, 0o666)
         listener.listen(8)
         while True:
-            conn, _ = listener.accept()
+            try:
+                conn, _ = listener.accept()
+            except OSError as exc:
+                LOG.warning('accept failed: %s', exc)
+                if exc.errno in (errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM):
+                    time.sleep(0.1)
+                continue
             if slots.acquire(blocking=False):
                 threading.Thread(target=handle, args=(conn,), daemon=True).start()
             else:

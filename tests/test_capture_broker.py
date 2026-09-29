@@ -3,7 +3,7 @@ import json
 import os
 import socket
 import unittest
-from vm_dbus_proxy.capture_broker import receive_request, read_status
+from vm_dbus_proxy.capture_broker import receive_request, read_status, PIPEWIRE_CONF
 
 
 class BrokerTests(unittest.TestCase):
@@ -47,3 +47,11 @@ class BrokerTests(unittest.TestCase):
                 read_status(readfd, None)
         finally:
             os.close(readfd)
+
+    def test_private_pipewire_loads_no_plugins_by_client_name(self):
+        # spa-node-factory and adapter both honour a client's library.name.
+        for module in ('spa-node-factory', 'adapter', 'spa-device-factory'):
+            self.assertNotIn('libpipewire-module-' + module, PIPEWIRE_CONF)
+        # Per-socket access; access.force is ignored (legacy flatpak detection).
+        self.assertIn('access.socket', PIPEWIRE_CONF)
+        self.assertNotIn('access.force', PIPEWIRE_CONF)

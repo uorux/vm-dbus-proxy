@@ -42,10 +42,11 @@ class HostTests(unittest.TestCase):
         key='/org/freedesktop/portal/desktop/session/1_2/abc'
         request='/org/freedesktop/portal/desktop/request/1_2/start'
         select=frame(message(1,81,{1:PATH,2:SCREEN,3:'SelectSources',6:':1.55',8:'oa{sv}'},
-                             (key,[('multiple',('b',1)),('cursor_mode',('u',4))])))
+                             (key,[('multiple',('b',1)),('cursor_mode',('u',4)),('persist_mode',('u',2)),('restore_token',('s','t'))])))
         h.from_guest(select.data)
         forwarded=frame(h.upstream.sendall.call_args.args[0])
-        self.assertEqual(dict(body(forwarded)[1]),{'multiple':('b',0),'cursor_mode':('u',2)})
+        # One stream, cursor embedded, and always the host picker (no restore).
+        self.assertEqual(dict(body(forwarded)[1]),{'multiple':('b',0),'cursor_mode':('u',2),'persist_mode':('u',0)})
         call=frame(message(1,82,{1:PATH,2:SCREEN,3:'Start',6:':1.55',8:'osa{sv}'},(key,'',[])))
         h.from_guest(call.data)
         h.from_host(frame(message(2,11,{5:3,7:':1.55',8:'o'},(request,))),[])
@@ -114,10 +115,60 @@ class HostTests(unittest.TestCase):
         h=self.make_host(); h.requests['/r']=('/org/freedesktop/portal/desktop/session/x/y',':1.5')
         f=frame(message(4,12,{1:'/r',2:'org.freedesktop.portal.Request',3:'Response',7:':1.5',8:'ua{sv}'},(0,[('streams',('a(ua{sv})',[(1,[]),(2,[])]))])))
         h.from_host(f,[]); self.assertEqual(body(frame(h.tunnel.send.call_args.args[1])),(2,[]))
-    def test_spoofed_response_rejected(self):
-        h=self.make_host(); h.requests['/r']=('/org/freedesktop/portal/desktop/session/x/y',':1.5')
-        f=frame(message(4,12,{1:'/r',2:'org.freedesktop.portal.Request',3:'Response',7:':1.6',8:'ua{sv}'},(0,[])))
-        with self.assertRaises(ValueError): h.from_host(f,[])
+        close=frame(h.upstream.sendall.call_args.args[0])
+        self.assertEqual((close.fields[1],close.fields[3],close.flags&1),('/org/freedesktop/portal/desktop/session/x/y','Close',1))
+    def test_spoofed_response_is_not_an_approval(self):
+        h=self.make_host(); key='/org/freedesktop/portal/desktop/session/x/y'; h.requests['/r']=(key,':1.5')
+        streams=[('streams',('a(ua{sv})',[(72,[])]))]
+        f=frame(message(4,12,{1:'/r',2:'org.freedesktop.portal.Request',3:'Response',7:':1.6',8:'ua{sv}'},(0,streams)))
+        h.from_host(f,[])
+        # Passed through untouched; no remote opened; the real answer still counts.
+        h.tunnel.send.assert_called_once_with(b'D',f.data); h.upstream.sendall.assert_not_called()
+        self.assertIn('/r',h.requests)
+        real=frame(message(4,13,{1:'/r',2:'org.freedesktop.portal.Request',3:'Response',7:':1.5',8:'ua{sv}'},(0,streams)))
+        with patch('threading.Timer'): h.from_host(real,[])
+        self.assertEqual(frame(h.upstream.sendall.call_args.args[0]).fields[3],'OpenPipeWireRemote')
+        self.assertNotIn('/r',h.requests); h.close()
+    def test_outstanding_calls_do_not_retain_messages(self):
+        h=self.make_host()
+        big=frame(message(1,7,{1:'/x',3:'Big',6:':1.9',8:'ay'},([0]*(1<<20),)))
+        h.send_upstream(big)
+        (entry,)=h.pending.values()
+        self.assertFalse(any(isinstance(v,(bytes,bytearray)) or hasattr(v,'data') for v in entry))
+        self.assertLess(len(repr(entry)),200)
+    def test_start_tracking_is_bounded(self):
+        from vm_dbus_proxy.capture_proxy import MAX_REQUESTS
+        h=self.make_host()
+        for i in range(MAX_REQUESTS+5):
+            call=frame(message(1,100+i,{1:PATH,2:SCREEN,3:'Start',6:PORTAL,8:'osa{sv}'},('/org/freedesktop/portal/desktop/session/1/s%d'%i,'',[])))
+            h.send_upstream(call)
+            serial=frame(h.upstream.sendall.call_args.args[0]).serial
+            h.from_host(frame(message(2,10+i,{5:serial,7:':1.5',8:'o'},('/org/freedesktop/portal/desktop/request/1/r%d'%i,))),[])
+        self.assertEqual(len(h.requests),MAX_REQUESTS)
+        self.assertIn('/org/freedesktop/portal/desktop/request/1/r%d'%(MAX_REQUESTS+4),h.requests)
+    def test_host_fd_call_is_answered_upstream(self):
+        import os
+        from helpers import stream_pair, feed
+        from vm_dbus_proxy.capture_proxy import receive_fds
+        h=self.make_host()
+        call=message(1,31,{1:'/app',3:'TakeFD',7:':1.9',8:'h',9:1},(0,))
+        a,b=stream_pair(); r,w=os.pipe()
+        try:
+            feed(b,call,[r]); received,descriptors=receive_fds(b)
+            h.from_host(received,descriptors)
+            h.tunnel.send.assert_not_called()
+            error=frame(h.upstream.sendall.call_args.args[0])
+            self.assertEqual((error.message_type,error.fields[5],error.fields[6]),(3,31,':1.9'))
+        finally: os.close(w); a.close(); b.close()
+    def test_malformed_tunnel_records_are_protocol_errors(self):
+        from vm_dbus_proxy.capture_proxy import record
+        from vm_dbus_proxy.protocol import ProtocolError
+        for payload in (b'[]',b'{}',b'{"session":["x"]}',b'{"session":{}}'):
+            with self.subTest(payload=payload), self.assertRaises(ProtocolError): record(payload)
+        h=self.make_host()
+        with self.assertRaises(ProtocolError): h.ready(b'{"session":"/s","node":"7"}')
+        g=Guest(Mock(),'/broker',Mock())
+        with self.assertRaises(ProtocolError): g.start(b'{"session":"/org/freedesktop/portal/desktop/session/a/b","sender":5}')
 
 class GuestTests(unittest.TestCase):
     def test_unavailable_pipewire_returns_error(self):
@@ -126,15 +177,21 @@ class GuestTests(unittest.TestCase):
         guest.from_app(f,True)
         result=frame(guest.client.sendall.call_args.args[0]); self.assertEqual(result.message_type,3); self.assertEqual(result.fields[5],71)
     def test_pipewire_reply_has_fd_index_and_portal_sender(self):
-        guest=Guest(Mock(),'/broker',Mock()); guest.deliver=Mock()
-        key='/org/freedesktop/portal/desktop/session/x/y'
-        guest.sessions[key]=Mock(pw=42,sender=':1.7')
-        call=frame(message(1,71,{1:PATH,2:SCREEN,3:'OpenPipeWireRemote',6:PORTAL,8:'oa{sv}'},(key,[])))
-        guest.from_app(call,True)
-        data,fd=guest.deliver.call_args.args
-        self.assertEqual(fd,42)
-        # Parse FD-bearing wire data using a real disposable received FD.
         import os
+        guest=Guest(Mock(),'/broker',Mock()); seen=[]
+        guest.deliver=Mock(side_effect=lambda data,fd: seen.append(os.fstat(fd).st_ino))
+        key='/org/freedesktop/portal/desktop/session/x/y'
+        pr,pw=os.pipe()
+        guest.sessions[key]=Mock(pw=pr,sender=':1.7')
+        call=frame(message(1,71,{1:PATH,2:SCREEN,3:'OpenPipeWireRemote',6:PORTAL,8:'oa{sv}'},(key,[])))
+        try:
+            guest.from_app(call,True)
+            data,fd=guest.deliver.call_args.args
+            # A private duplicate of the session's remote, closed after sending.
+            self.assertNotEqual(fd,pr); self.assertEqual(seen,[os.fstat(pr).st_ino])
+            with self.assertRaises(OSError): os.fstat(fd)
+        finally: os.close(pr); os.close(pw)
+        # Parse FD-bearing wire data using a real disposable received FD.
         from helpers import stream_pair,feed
         from vm_dbus_proxy.protocol import read_frame
         a,b=stream_pair(); r,w=os.pipe()

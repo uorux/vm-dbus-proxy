@@ -6,6 +6,7 @@ capture. Everything else follows the ordinary no-FD policy.
 """
 import argparse
 import array
+import errno
 import json
 import hashlib
 import logging
@@ -17,7 +18,7 @@ import threading
 import time
 from . import protocol
 from .capture_wire import body as decode_body, message, replace_body, replace_fields, replace_reply_serial
-from .proxy import auth_line
+from .proxy import auth_line, raise_fd_limit
 
 LOG=logging.getLogger('vm-dbus-capture')
 PORTAL='org.freedesktop.portal.Desktop'
@@ -27,6 +28,7 @@ BUS_PATH='/org/freedesktop/DBus'
 PATH='/org/freedesktop/portal/desktop'
 LIMIT=protocol.MAX_MESSAGE_BYTES
 MAX_SESSIONS=4
+MAX_REQUESTS=64
 
 
 def body(frame):
@@ -64,6 +66,13 @@ def receive_fds(sock):
     except BaseException:
         for fd in fds: os.close(fd)
         raise
+
+def record(payload):
+    """A JSON tunnel record naming a session; the peer end is untrusted."""
+    value=json.loads(payload)
+    if not isinstance(value,dict) or not isinstance(value.get('session'),str):
+        raise protocol.ProtocolError('invalid tunnel record')
+    return value
 
 def exact(sock,n):
     out=bytearray()
@@ -208,12 +217,27 @@ def host_auth(tunnel,upstream):
 class Host(Adapter):
     def __init__(self,tunnel,broker_path,upstream):
         super().__init__(tunnel,broker_path); self.upstream=upstream; self.write_lock=threading.Lock(); self.serial=1
-        self.pending={}; self.requests={}; self.held={}; self.timers={}; self.name=None; self.portal_sender=None
+        self.pending={}; self.requests={}; self.held={}; self.timers={}; self.portal_sender=None
+    def classify(self,f):
+        """What a reply to this call will need. Keep that, never the call:
+        up to 4096 calls may be outstanding, each up to the frame limit."""
+        dest,path,iface,member,sig=(f.fields.get(k) for k in (6,1,2,3,8))
+        small=len(f.data)<=65536
+        if (dest==BUS and path==BUS_PATH and iface==BUS and member=='GetNameOwner'
+                and sig=='s' and small and body(f)==(PORTAL,)):
+            return 'owner',None
+        if (dest is not None and dest in (PORTAL,self.portal_sender) and path==PATH and iface==SCREEN
+                and member=='Start' and sig=='osa{sv}' and small):
+            key=body(f)[0]
+            if len(key)<=1024: return 'start',key
+        return None,None
     def send_upstream(self,f,internal=None):
         with self.write_lock:
             serial=self.serial; self.serial=self.serial%0xffffffff+1
             if len(self.pending)>=4096: raise protocol.ProtocolError('too many outstanding calls')
-            if f.message_type==1 and not f.flags&1: self.pending[serial]=(f,internal)
+            if f.message_type==1 and not f.flags&1:
+                kind,arg=self.classify(f)
+                self.pending[serial]=(f.serial,kind,arg,f.fields.get(6)==PORTAL,internal)
             # Preserve the opaque body and just change the fixed-header serial.
             data=bytearray(f.data); data[8:12]=struct.pack(f.endian+'I',serial); self.upstream.sendall(data)
     def from_guest(self,data):
@@ -221,12 +245,14 @@ class Host(Adapter):
         if f.fd_count: raise protocol.ProtocolError('FD in tunnel')
         if f.message_type==1 and f.fields.get(2)=='org.freedesktop.portal.Session' and f.fields.get(3)=='Close':
             self.close_session(f.fields.get(1))
-        if f.message_type==1 and f.fields.get(6) in (PORTAL,self.portal_sender) and f.fields.get(1)==PATH and f.fields.get(2)==SCREEN and f.fields.get(3)=='SelectSources':
+        if f.message_type==1 and f.fields.get(6) in (PORTAL,self.portal_sender) and f.fields.get(1)==PATH and f.fields.get(2)==SCREEN and f.fields.get(3)=='SelectSources' and f.fields.get(8)=='oa{sv}':
             key,options=body(f)
             opts=dict(options)
             # The bridge publishes one source with cursor pixels embedded.
             opts['multiple']=('b',0)
             if opts.get('cursor_mode',('u',1))[1]==4: opts['cursor_mode']=('u',2)
+            # Every VM share goes through the host picker: no restore tokens.
+            opts['persist_mode']=('u',0); opts.pop('restore_token',None)
             f=frame(replace_body(f,(key,list(opts.items()))))
         self.send_upstream(f)
     def start_media(self,key,node,pw):
@@ -243,19 +269,16 @@ class Host(Adapter):
         try:
             pending=self.pending.pop(f.fields.get(5),None) if f.message_type in (2,3) else None
             if pending:
-                call,internal=pending
+                serial,kind,arg,to_portal,internal=pending
                 # GDBus resolves the well-known name before calling a proxy;
                 # all its portal calls may therefore target only :1.NNN.
                 # Learn that identity only from the bus daemon's reply.
-                if (call.fields.get(6)==BUS and call.fields.get(1)==BUS_PATH
-                        and call.fields.get(2)==BUS and call.fields.get(3)=='GetNameOwner'
-                        and f.message_type==2 and f.fields.get(7)==BUS
-                        and call.fields.get(8)=='s' and body(call)==(PORTAL,)
+                if (kind=='owner' and f.message_type==2 and f.fields.get(7)==BUS
                         and f.fields.get(8)=='s'):
                     owner=body(f)[0]
                     if not owner.startswith(':'): raise protocol.ProtocolError('invalid portal owner')
                     self.portal_sender=owner
-                elif (call.fields.get(6)==PORTAL and f.message_type==2
+                elif (to_portal and f.message_type==2
                         and f.fields.get(7,'').startswith(':')):
                     self.portal_sender=f.fields[7]
                 if internal:
@@ -269,20 +292,23 @@ class Host(Adapter):
                         except Exception as exc: LOG.warning('capture start failed: %s',exc); self.fail(key)
                         finally: os.close(pw)
                     threading.Thread(target=boot,daemon=True).start(); return
-                if call.fields.get(2)=='org.freedesktop.DBus' and call.fields.get(3)=='Hello' and f.message_type==2:
-                    self.name=body(f)[0]
-                if call.fields.get(6) in (PORTAL,self.portal_sender) and call.fields.get(1)==PATH and call.fields.get(2)==SCREEN and call.fields.get(3)=='Start' and f.message_type==2:
-                    key=body(call)[0]; request=body(f)[0]; self.requests[request]=(key,f.fields.get(7))
+                if kind=='start' and f.message_type==2 and f.fields.get(8)=='o':
+                    request=body(f)[0]
+                    while len(self.requests)>=MAX_REQUESTS: self.requests.pop(next(iter(self.requests)))
+                    self.requests[request]=(arg,f.fields.get(7))
                     LOG.info('tracking ScreenCast Start response')
-                fields=dict(f.fields); fields[5]=call.serial
-                fdata=replace_reply_serial(f,call.serial)
+                fdata=replace_reply_serial(f,serial)
             else: fdata=f.data
             if fds:
                 if f.message_type in (2,3):
                     # Use restored client reply serial, and strip the FD header.
-                    fields=dict(f.fields); fields[5]=call.serial if pending else fields[5]
+                    fields=dict(f.fields); fields[5]=serial if pending else fields[5]
                     from dataclasses import replace
                     self.tunnel.send(b'D',protocol.make_error(replace(f,fields=fields),f.serial))
+                elif f.message_type==1 and not f.flags&1:
+                    # A host peer's FD-bearing call: answer it rather than
+                    # leaving the caller to time out.
+                    self.send_upstream(frame(protocol.make_error(f)))
                 return
             if (f.message_type==4 and f.fields.get(7)==BUS and f.fields.get(1)==BUS_PATH
                     and f.fields.get(2)==BUS and f.fields.get(3)=='NameOwnerChanged'
@@ -293,30 +319,42 @@ class Host(Adapter):
                     self.portal_sender=new or None
             if f.message_type==4 and f.fields.get(2)=='org.freedesktop.portal.Session' and f.fields.get(3)=='Closed':
                 key=f.fields.get(1); self.close_session(key); self.tunnel.json(b'X',{'session':key})
-            key=self.requests.pop(f.fields.get(1),None) if f.message_type==4 and f.fields.get(2)=='org.freedesktop.portal.Request' and f.fields.get(3)=='Response' else None
-            if key:
-                key,sender=key
-                if f.fields.get(7)!=sender: raise protocol.ProtocolError("unexpected portal sender")
+            tracked=self.requests.get(f.fields.get(1)) if (f.message_type==4 and f.fields.get(2)=='org.freedesktop.portal.Request'
+                and f.fields.get(3)=='Response' and f.fields.get(8)=='ua{sv}') else None
+            # Only the portal that answered Start can approve it; anything
+            # else on that path passes through untouched and is not capture.
+            if tracked and f.fields.get(7)==tracked[1]:
+                del self.requests[f.fields.get(1)]
+                key,sender=tracked
                 result,options=body(f); streams=dict(options).get('streams')
                 if result==0 and streams:
                     if streams[0]!='a(ua{sv})' or len(streams[1])!=1:
-                        self.tunnel.send(b'D',replace_body(f,(2,[]))); return
+                        self.refuse(f,key); return
                     node=streams[1][0][0]
                     LOG.info('approved ScreenCast stream; opening restricted PipeWire remote')
                     with self.lock:
-                        if self.closed or key in self.held or len(self.held)>=MAX_SESSIONS:
-                            self.tunnel.send(b'D',replace_body(f,(2,[]))); return
-                        self.held[key]=f
-                        timer=threading.Timer(30,lambda: self.fail(key,timeout=True))
-                        self.timers[key]=timer
-                        timer.daemon=True; timer.start()
+                        refused=self.closed or key in self.held or len(self.held)>=MAX_SESSIONS
+                        if not refused:
+                            self.held[key]=f
+                            timer=threading.Timer(30,lambda: self.fail(key,timeout=True))
+                            self.timers[key]=timer
+                            timer.daemon=True; timer.start()
+                    if refused: self.refuse(f,key); return
                     call=frame(message(1,1,{1:PATH,2:SCREEN,3:'OpenPipeWireRemote',6:PORTAL,8:'oa{sv}'},(key,[])))
                     self.send_upstream(call,(key,node)); return
             self.tunnel.send(b'D',fdata)
         finally:
             for fd in fds: os.close(fd)
+    def refuse(self,response,key):
+        """An approved share this bridge cannot carry: fail it to the app and
+        end the host session, so the host's stream and indicator go away."""
+        LOG.warning('approved ScreenCast stream cannot be bridged; closing it')
+        self.tunnel.send(b'D',replace_body(response,(2,[])))
+        close=frame(message(1,1,{1:key,2:'org.freedesktop.portal.Session',3:'Close',6:PORTAL},flags=1))
+        try: self.send_upstream(close)
+        except OSError: pass
     def ready(self,payload):
-        value=json.loads(payload); key=value['session']; node=value['node']
+        value=record(payload); key=value['session']; node=value.get('node')
         if type(node)!=int or not 0<node<2**32: raise protocol.ProtocolError('invalid guest node')
         with self.lock:
             f=self.held.pop(key,None)
@@ -363,7 +401,9 @@ class Guest(Adapter):
                 n=self.client.sendmsg([data],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[fd]))])
                 if n<len(data): self.client.sendall(data[n:])
     def start(self,payload):
-        value=json.loads(payload); key=value['session']; session=self.new_session(key); session.sender=value.get('sender')
+        value=record(payload); key=value['session']; sender=value.get('sender')
+        if sender is not None and not isinstance(sender,str): raise protocol.ProtocolError('invalid portal sender')
+        session=self.new_session(key); session.sender=sender
         threading.Thread(target=self.pump,args=(session,),daemon=True).start()
         def boot():
             try:
@@ -378,16 +418,24 @@ class Guest(Adapter):
                 LOG.warning('guest capture start failed: %s',exc); self.close_session(key); self.tunnel.json(b'X',{'session':key})
         threading.Thread(target=boot,daemon=True).start()
     def from_app(self,f,negotiated):
-        if f.message_type==1 and f.fields.get(1)==PATH and f.fields.get(2)==SCREEN and f.fields.get(3)=='OpenPipeWireRemote':
-            key=body(f)[0]; s=self.sessions.get(key)
-            if f.fields.get(6)!=PORTAL and (not s or f.fields.get(6)!=s.sender):
-                self.tunnel.send(b'D',f.data); return
-            if not negotiated or not s or s.pw is None:
-                self.deliver(protocol.make_error(f,self.serial)); self.serial+=1; return
-            fields={5:f.serial,8:'h',9:1}
-            if s.sender: fields[7]=s.sender
-            if 7 in f.fields: fields[6]=f.fields[7]
-            self.deliver(message(2,self.serial,fields,(0,)),s.pw); self.serial+=1; return
+        if (f.message_type==1 and f.fields.get(1)==PATH and f.fields.get(2)==SCREEN
+                and f.fields.get(3)=='OpenPipeWireRemote' and f.fields.get(8)=='oa{sv}'):
+            key=body(f)[0]
+            with self.lock:
+                s=self.sessions.get(key)
+                # Duplicate under the lock: close_session may close s.pw.
+                pw=os.dup(s.pw) if negotiated and s and s.pw is not None else None
+            try:
+                if f.fields.get(6)!=PORTAL and (not s or f.fields.get(6)!=s.sender):
+                    self.tunnel.send(b'D',f.data); return
+                if pw is None:
+                    self.deliver(protocol.make_error(f,self.serial)); self.serial+=1; return
+                fields={5:f.serial,8:'h',9:1}
+                if s.sender: fields[7]=s.sender
+                if 7 in f.fields: fields[6]=f.fields[7]
+                self.deliver(message(2,self.serial,fields,(0,)),pw); self.serial+=1; return
+            finally:
+                if pw is not None: os.close(pw)
         if f.fd_count:
             if not negotiated: raise protocol.ProtocolError('FD without negotiation')
             if f.message_type==1 and not f.flags&1:
@@ -431,7 +479,7 @@ def run_connection(role,client,upstream,broker_path):
             kind,payload=tunnel.recv()
             if kind==b'M': adapter.media(payload)
             elif kind==b'X':
-                key=json.loads(payload)['session']
+                key=record(payload)['session']
                 if role=='host': adapter.fail(key)
                 else: adapter.close_session(key)
             elif kind==b'D':
@@ -440,7 +488,7 @@ def run_connection(role,client,upstream,broker_path):
             elif kind==b'S' and role=='guest': adapter.start(payload)
             elif kind==b'N' and role=='host': adapter.ready(payload)
             else: raise protocol.ProtocolError('unexpected tunnel record')
-    except (OSError,EOFError,ValueError,KeyError) as exc: LOG.info('%s connection ended: %s',role,exc)
+    except Exception as exc: LOG.info('%s connection ended: %s',role,exc)
     finally:
         abort()
         if adapter: adapter.close()
@@ -451,6 +499,7 @@ def main():
     p.add_argument('--role',choices=('host','guest'),required=True)
     p.add_argument('--listen',required=True); p.add_argument('--upstream',required=True); p.add_argument('--broker',required=True)
     a=p.parse_args(); logging.basicConfig(level=logging.INFO)
+    raise_fd_limit()
     listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
     listener.bind(a.listen); os.chmod(a.listen,0o600); listener.listen(32)
     slots=threading.BoundedSemaphore(64)
@@ -462,7 +511,13 @@ def main():
         finally: client.close(); up.close(); slots.release()
     try:
         while True:
-            client,_=listener.accept()
+            # Never let one failed accept (EMFILE and the like) end the loop:
+            # that would disconnect every app of the VM.
+            try: client,_=listener.accept()
+            except OSError as exc:
+                LOG.warning('accept failed: %s',exc)
+                if exc.errno in (errno.EMFILE,errno.ENFILE,errno.ENOBUFS,errno.ENOMEM): time.sleep(0.1)
+                continue
             if not slots.acquire(False): client.close(); continue
             threading.Thread(target=handle,args=(client,),daemon=True).start()
     finally: listener.close(); os.unlink(a.listen)

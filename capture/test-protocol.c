@@ -4,7 +4,9 @@
 static struct pw_buffer *test_dequeue(struct pw_stream *stream);
 static int test_queue(struct pw_stream *stream, struct pw_buffer *buffer);
 static ssize_t test_send(int fd, const void *data, size_t length, int flags);
+static int test_trigger(struct pw_stream *stream);
 #define pw_stream_dequeue_buffer test_dequeue
+#define pw_stream_trigger_process test_trigger
 #define pw_stream_queue_buffer test_queue
 #define send test_send
 #define main capture_program_main
@@ -13,8 +15,9 @@ static ssize_t test_send(int fd, const void *data, size_t length, int flags);
 #include <assert.h>
 
 static struct pw_buffer *dequeued[32];
-static unsigned dequeue_count, dequeue_next, returned, frames;
-static struct packet last_frame;
+static unsigned dequeue_count, dequeue_next, returned, frames, dones, triggers;
+static struct packet last_frame, last_done;
+static int test_trigger(struct pw_stream *stream) { (void)stream;triggers++;return 0; }
 static struct pw_buffer *test_dequeue(struct pw_stream *stream) {
     (void)stream;
     return dequeue_next<dequeue_count?dequeued[dequeue_next++]:NULL;
@@ -26,6 +29,7 @@ static ssize_t test_send(int fd, const void *data, size_t length, int flags) {
     (void)fd;(void)flags;assert(length==sizeof(struct packet));
     struct packet p;memcpy(&p,data,length);
     if(le32toh(p.op)==FRAME) { frames++;last_frame=p; }
+    if(le32toh(p.op)==DONE) { dones++;last_done=p; }
     return length;
 }
 
@@ -60,16 +64,44 @@ int main(void) {
     assert(a.stopping);pw_main_loop_destroy(a.loop);
     a=fresh();a.guest=false;p=config(1920,1080);p.op=htole32(DONE);receive_packet(&a,p);
     assert(a.stopping);pw_main_loop_destroy(a.loop);
-    /* Frames can queue before the guest links; validate their crop bounds and
-     * sequence without calling any PipeWire stream method. */
+    /* Validate crop bounds and sequence of guest frames. */
+    struct pw_buffer guest_buffer={0};
     a=fresh();receive_packet(&a,config(1920,1080));a.stream=(struct pw_stream *)1;a.count=1;
+    a.streaming=true;a.slots[0].pw=&guest_buffer;triggers=0;
     p=config(1920,1080);p.op=htole32(FRAME);p.seq=htole64(1);p.format=0;
-    receive_packet(&a,p);assert(!a.stopping && a.slots[0].pending && a.slots[0].crop.size.width==1920);
-    receive_packet(&a,p);assert(a.stopping);pw_main_loop_destroy(a.loop);
+    receive_packet(&a,p);assert(!a.stopping && a.slots[0].pending && a.slots[0].crop.size.width==1920 && triggers==1);
+    receive_packet(&a,p);assert(a.stopping);pw_main_loop_destroy(a.loop); /* replayed sequence */
     a=fresh();receive_packet(&a,config(1920,1080));a.stream=(struct pw_stream *)1;a.count=1;
+    a.streaming=true;a.slots[0].pw=&guest_buffer;
     p.id=htole32(UINT32_MAX);receive_packet(&a,p);assert(a.stopping);pw_main_loop_destroy(a.loop);
     a=fresh();receive_packet(&a,config(1920,1080));a.stream=(struct pw_stream *)1;a.count=1;
+    a.streaming=true;a.slots[0].pw=&guest_buffer;
     p.id=0;p.format=htole32(8);receive_packet(&a,p);assert(a.stopping);pw_main_loop_destroy(a.loop);
+    /* Not streaming (consumer paused or not linked yet): return at once. */
+    a=fresh();receive_packet(&a,config(1920,1080));a.stream=(struct pw_stream *)1;a.count=1;
+    a.slots[0].pw=&guest_buffer;dones=0;p.format=0;
+    receive_packet(&a,p);assert(!a.stopping && !a.slots[0].pending && dones==1 && le64toh(last_done.seq)==1);
+    pw_main_loop_destroy(a.loop);
+    /* A slot still lent to a consumer may be re-announced after the host
+     * reclaimed it: DONE the old frame, then lend the new one. */
+    {
+        a=fresh();receive_packet(&a,config(1920,1080));a.stream=(struct pw_stream *)1;a.count=1;a.streaming=true;
+        struct spa_buffer sb={0};struct pw_buffer pb={.buffer=&sb};a.slots[0].pw=&pb;
+        a.slots[0].sent_ns=1;a.slots[0].queued_seq=1;a.sequence=1;
+        p=config(1920,1080);p.op=htole32(FRAME);p.seq=htole64(2);p.format=0;
+        receive_packet(&a,p);assert(!a.stopping && a.slots[0].pending && a.slots[0].sent_ns);
+        dequeued[0]=&pb;dequeue_count=1;dequeue_next=returned=dones=0;process(&a);
+        assert(!a.stopping && dones==1 && le64toh(last_done.seq)==1);
+        assert(returned==1 && !a.slots[0].pending && a.slots[0].queued_seq==2 && a.slots[0].sent_ns);
+        /* The consumer unlinks: its buffers go, the share stays; relinking reuses the slot. */
+        dones=0;remove_buffer(&a,&pb);
+        assert(!a.stopping && dones==1 && le64toh(last_done.seq)==2 && !a.slots[0].pw);
+        struct spa_chunk gc={0};struct spa_data gd={.type=1<<SPA_DATA_DmaBuf,.chunk=&gc};
+        sb=(struct spa_buffer){.n_datas=1,.datas=&gd};a.slots[0].imported.size=4096;a.slots[0].imported.strides[0]=7680;
+        add_buffer(&a,&pb);assert(!a.stopping && a.slots[0].pw==&pb && gd.type==SPA_DATA_DmaBuf);
+        struct pw_buffer extra={.buffer=&sb};add_buffer(&a,&extra);assert(a.stopping); /* pool is full */
+        pw_main_loop_destroy(a.loop);
+    }
     /* Exercise the actual SPA DONT_FIXATE parser and the producer's two
      * negotiation callbacks, with no live daemon or GPU required. */
     a=fresh();a.guest=false;
@@ -127,9 +159,15 @@ int main(void) {
     receive_packet(&a,done);assert(!a.stopping && returned==5 && !a.slots[0].sent_ns);
     dequeued[0]=&pw_buffers[0];dequeue_next=0;process(&a);
     assert(frames==2 && le64toh(last_frame.seq)==2 && le32toh(last_frame.slot)==0);
+    /* A stale DONE (frame already reclaimed) is ignored; a future one is not. */
+    done.seq=htole64(1);receive_packet(&a,done);assert(!a.stopping && returned==5);
+    done.seq=htole64(3);receive_packet(&a,done);assert(a.stopping);a.stopping=false;
+    /* The guest never answers: the host takes the buffer back. */
+    a.slots[0].sent_ns=1;timer(&a,1);assert(!a.stopping && returned==6 && !a.slots[0].sent_ns && a.reclaimed==1);
+    done.seq=htole64(2);receive_packet(&a,done);assert(!a.stopping && returned==6); /* late DONE */
     p.count=0;receive_packet(&a,p);assert(!a.consumer_active);
     dequeued[0]=&pw_buffers[3];dequeue_next=0;process(&a);
-    assert(frames==2 && returned==6 && !a.stopping);
+    assert(frames==2 && returned==7 && !a.stopping);
     p.count=htole32(2);receive_packet(&a,p);assert(a.stopping);
     pw_main_loop_destroy(a.loop);
     puts("capture control validation: passed");pw_deinit();return 0;
